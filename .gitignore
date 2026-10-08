@@ -1,0 +1,9 @@
+data/
+shots/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.tmp
+dist/
+build/
