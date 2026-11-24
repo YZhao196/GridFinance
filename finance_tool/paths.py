@@ -45,6 +45,16 @@ DATA_DIR = APP_ROOT / "data"
 SECRETS_PATH = DATA_DIR / "secrets.json"
 SHOTS_DIR = APP_ROOT / "shots"
 
+# Where statement files arrive, and where the importer moves them once read. The inbox is
+# polled by the app shell; the backend only provides the scan.
+INBOX_DIR = DATA_DIR / "statements" / "inbox"
+PROCESSED_DIR = DATA_DIR / "statements" / "processed"
+
+# Generated markdown summaries and the assistant's profile notes. Both are disposable —
+# the database is the source of truth — so they sit beside it rather than inside it.
+EXPORTS_DIR = DATA_DIR / "exports"
+PROFILE_PATH = DATA_DIR / "profile.md"
+
 # Where to look for a bundled face, in order. Absolute, because a built app's working
 # directory is wherever the user happened to launch it from.
 FONT_DIRS = tuple(RESOURCE_ROOT / part for part in ("assets/fonts", "assets", "fonts"))

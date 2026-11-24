@@ -259,3 +259,34 @@ def item_named(store: Store, name: str) -> Item:
 
 def view_of(store: Store):
     return store.view()
+
+
+CAMT053 = """<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+ <BkToCstmrStmt>
+  <Stmt>
+   <Id>S1</Id>
+   <Acct>
+    <Nm>Everyday</Nm>
+    <Id><Othr><Id>12345678</Id></Othr></Id>
+    <Ccy>AUD</Ccy>
+   </Acct>
+   <Bal><Tp><CdOrPrtry><Cd>OPBD</Cd></CdOrPrtry></Tp><Amt Ccy="AUD">1000.00</Amt><CdtDbtInd>CRDT</CdtDbtInd></Bal>
+   <Bal><Tp><CdOrPrtry><Cd>CLBD</Cd></CdOrPrtry></Tp><Amt Ccy="AUD">942.20</Amt><CdtDbtInd>CRDT</CdtDbtInd></Bal>
+   <Ntry>
+    <Amt Ccy="AUD">57.80</Amt><CdtDbtInd>DBIT</CdtDbtInd>
+    <BookgDt><Dt>2026-10-01</Dt></BookgDt>
+    <ValDt><Dt>2026-10-02</Dt></ValDt>
+    <AcctSvcrRef>REF1</AcctSvcrRef>
+    <NtryDtls><TxDtls><RmtInf><Ustrd>COLES 1234</Ustrd></RmtInf></TxDtls></NtryDtls>
+   </Ntry>
+   <Ntry>
+    <Amt Ccy="AUD">2500.00</Amt><CdtDbtInd>CRDT</CdtDbtInd>
+    <BookgDt><Dt>2026-10-03</Dt></BookgDt>
+    <AcctSvcrRef>REF2</AcctSvcrRef>
+    <NtryDtls><TxDtls><RltdPties><Dbtr><Nm>ACME PTY LTD</Nm></Dbtr></RltdPties><RmtInf><Ustrd>SALARY</Ustrd></RmtInf></TxDtls></NtryDtls>
+   </Ntry>
+  </Stmt>
+ </BkToCstmrStmt>
+</Document>
+"""

@@ -35,9 +35,12 @@ from finance_tool.store.codec import decode_dataclass, encode
 from finance_tool.store.entities import (
     Account,
     Canvas,
+    ChatMessage,
     Goal,
+    ImportRecord,
     Item,
     Person,
+    ReviewItem,
     Rule,
     Settings,
     Snapshot,
@@ -45,7 +48,7 @@ from finance_tool.store.entities import (
     Transaction,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DB_NAME = "store.db"
 
@@ -59,6 +62,9 @@ TABLES: dict[str, tuple[Any, str]] = {
     "tracker": (TrackerItem, "id"),
     "people": (Person, "id"),
     "snapshots": (Snapshot, "date"),
+    "reviews": (ReviewItem, "id"),
+    "imports": (ImportRecord, "id"),
+    "messages": (ChatMessage, "id"),
 }
 
 SETTINGS_TABLE = "settings"
@@ -157,6 +163,121 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 def schema_version(conn: sqlite3.Connection) -> int:
     return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
+
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()
+    return row is not None
+
+
+def existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if not table_exists(conn, table):
+        return set()
+    return {row["name"] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+
+
+def missing_columns(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """(table, column) for every entity field an existing table does not have yet.
+
+    ``ensure_schema`` can create a missing table but cannot change one; this is the
+    detection that lets an old store gain a field instead of failing on its first write.
+    """
+    found: list[tuple[str, str]] = []
+    for table, (cls, _key) in TABLES.items():
+        present = existing_columns(conn, table)
+        if not present:
+            continue
+        for field in dataclasses.fields(cls):
+            if field.name not in present:
+                found.append((table, field.name))
+    return found
+
+
+def _is_optional(tp: Any) -> bool:
+    if isinstance(tp, types.UnionType) or get_origin(tp) is typing.Union:
+        return any(arg is type(None) for arg in get_args(tp))
+    return False
+
+
+def _quote(text: str) -> str:
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def _literal(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, (date, datetime)):
+        return _quote(value.isoformat())
+    if isinstance(value, (list, dict)):
+        return _quote(json.dumps(encode(value)))
+    if isinstance(value, str):
+        return _quote(value)
+    return None
+
+
+def _default_sql(field: dataclasses.Field, tp: Any) -> str | None:
+    """The SQL default for a field an existing row does not have.
+
+    An optional field stays NULL — absence is meaningful, and inventing ``''`` where the
+    type says "unknown" is the same mistake as drawing a zero. A required field gets the
+    dataclass's own default, so a row read back after migration matches one written today.
+    """
+    if _is_optional(tp):
+        return None
+    if field.default is not dataclasses.MISSING:
+        return _literal(field.default)
+    if field.default_factory is not dataclasses.MISSING:
+        return _literal(field.default_factory())
+    return None
+
+
+def upgrade_schema(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """Add any columns the entities have gained since the database was written.
+
+    Only additive changes here: SQLite cannot drop or retype a column in place, and a
+    destructive migration would need its own backup and its own justification. Returns the
+    columns added, so the caller can tell the user what happened.
+    """
+    if schema_version(conn) > SCHEMA_VERSION:
+        return []
+
+    added: list[tuple[str, str]] = []
+    # Explicit and all-or-nothing: SQLite copies the table for each ADD COLUMN, and a
+    # half-upgraded store that claims a version it does not have is worse than a failure.
+    started = not conn.in_transaction
+    if started:
+        conn.execute("BEGIN")
+    try:
+        for table, (cls, _key) in TABLES.items():
+            present = existing_columns(conn, table)
+            if not present:
+                continue
+            hints = typing.get_type_hints(cls)
+            for field in dataclasses.fields(cls):
+                if field.name in present:
+                    continue
+                tp = hints.get(field.name, Any)
+                clause = f'"{field.name}" {sql_type(tp)}'
+                default = _default_sql(field, tp)
+                if default is not None:
+                    clause += f" DEFAULT {default}"
+                conn.execute(f'ALTER TABLE "{table}" ADD COLUMN {clause}')
+                added.append((table, field.name))
+
+        if added or schema_version(conn) < SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        if started:
+            conn.commit()
+    except Exception:
+        if started:
+            conn.rollback()
+        raise
+    return added
 
 
 def read_generation(conn: sqlite3.Connection) -> int:
@@ -265,7 +386,7 @@ def read_settings(conn: sqlite3.Connection) -> Settings | None:
 
 
 def write_settings(conn: sqlite3.Connection, settings: Settings) -> None:
-    """Settings go in whole. There are nine of them and they are read together."""
+    """Settings go in whole. They are read together and the blob is the single copy."""
     data = encode(settings)
     data["canvases"] = []          # the canvases table is the only copy (see read_settings)
     conn.execute(f'INSERT OR REPLACE INTO "{SETTINGS_TABLE}" (id, data) VALUES (1, ?)',

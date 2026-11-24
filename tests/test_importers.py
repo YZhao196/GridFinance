@@ -5,8 +5,10 @@ import pytest
 
 from finance_tool.engine import importers as imp
 from finance_tool.store.entities import (
+    Account,
     Item,
     Rule,
+    Settings,
     StoreDocument,
     Transaction,
     EXPENSE,
@@ -388,6 +390,41 @@ def test_a_row_with_an_external_id_dedupes_on_that_id():
     assert len(plan.new) == 4
 
 
+def test_a_rule_amount_bound_is_honoured_on_import():
+    rule = Rule(id="r", match="COLES", category="Groceries",
+                amount_min=10.0, amount_max=100.0)
+    store = Store(doc=StoreDocument(accounts=[Account(id="a_1", name="Everyday")],
+                                    rules=[rule]),
+                  settings=Settings(), data_dir=None)
+
+    imp.import_rows(store, [imp.RawTxn(date=date(2026, 10, 1), amount=-900.0,
+                                       description="COLES")],
+                    source="csv", account="a_1")
+    assert store.doc.transactions[0].category is None
+    assert rule.hit_count == 0
+
+    imp.import_rows(store, [imp.RawTxn(date=date(2026, 10, 2), amount=-50.0,
+                                       description="COLES")],
+                    source="csv", account="a_1")
+    assert store.doc.transactions[1].category == "Groceries"
+    assert rule.hit_count == 1
+
+
+def test_a_provider_transfer_or_unfiled_hint_is_not_used():
+    store = Store(doc=StoreDocument(accounts=[Account(id="a_1", name="Everyday")]),
+                  settings=Settings(), data_dir=None)
+
+    imp.import_rows(store, [
+        imp.RawTxn(date=date(2026, 10, 1), amount=-100.0, description="TO SAVINGS",
+                   raw={"provider_category": "Transfers"}),
+        imp.RawTxn(date=date(2026, 10, 2), amount=-20.0, description="MYSTERY",
+                   raw={"provider_category": "Uncategorised"}),
+    ], source="csv", account="a_1")
+
+    assert [txn.category for txn in store.doc.transactions] == [None, None]
+    assert [txn.category_source for txn in store.doc.transactions] == ["", ""]
+
+
 def test_an_external_id_beats_a_matching_fingerprint():
     """The aggregator's id is identity; nothing else gets a vote."""
     row = imp.RawTxn(date=date(2026, 9, 1), amount=-520.0, description="RENT",
@@ -399,7 +436,10 @@ def test_an_external_id_beats_a_matching_fingerprint():
                                                         row.description, "a", "s.csv"))]
     plan = imp.plan_import(existing, [row], source="s.csv", account="a")
     assert len(plan.new) == 1
-    assert plan.new[0].fingerprint is None
+    assert plan.new[0].duplicate is False
+    # A fingerprint is still recorded as a secondary identity, but it did not decide
+    # this row: the external id did.
+    assert plan.new[0].fingerprint is not None
 
 
 def test_the_fingerprint_is_only_compared_within_one_source():

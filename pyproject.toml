@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gridfinance"
+version = "0.2.0"
+description = "A local-first personal budgeting backend: a recurring plan and a reconciled ledger"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.optional-dependencies]
+# Statement formats: without this extra, CSV, OFX and CAMT.053 still work and importing a
+# PDF reports the missing extra instead of failing obscurely.
+ingest = ["pdfplumber>=0.11"]
+# The assistant and the LLM categoriser. The app runs without either until a key is set.
+ai = ["anthropic>=0.40", "openai>=1.54"]
+# The stdio MCP server. Both the 1.x FastMCP surface and the 2.x module are accepted.
+mcp = ["mcp>=1.29"]
+dev = ["pytest>=8.3"]
+all = [
+    "pdfplumber>=0.11",
+    "anthropic>=0.40",
+    "openai>=1.54",
+    "mcp>=1.29",
+]
+
+[tool.setuptools.packages.find]
+include = ["finance_tool*"]

@@ -21,6 +21,7 @@ from finance_tool.engine import goals as gl
 from finance_tool.engine import ledger as led
 from finance_tool.engine import periods as per
 from finance_tool.engine.recurrence import monthly_equiv
+from finance_tool.engine import review as rev
 from finance_tool.engine import shared as shr
 from finance_tool.engine import tracker as trk
 from finance_tool.hooks.types import Hook, HookContext, Row, WidgetData, widget_data
@@ -285,7 +286,8 @@ def subscription_list(ctx: HookContext, config: dict) -> WidgetData | None:
 @hook("uncategorised_review")
 def uncategorised_review(ctx: HookContext, config: dict) -> WidgetData | None:
     count = len(cat.uncategorised(list(ctx.store.transactions)))
-    if count == 0:
+    queued = rev.open_count(ctx.store)
+    if count == 0 and queued == 0:
         return None
     suggestions = cat.suggest_rules(ctx.store, min_occurrences=2, limit=6)
     rows = [
@@ -298,11 +300,13 @@ def uncategorised_review(ctx: HookContext, config: dict) -> WidgetData | None:
     ]
     coverage = led.budget_coverage(ctx.store, ctx.span)
     return widget_data(
-        count,
+        count if count else queued,
         rows=rows,
-        note=cat.suggestions_summary(ctx.store),
+        note=(cat.suggestions_summary(ctx.store) if count
+              else f"{queued} waiting for review"),
         coverage=coverage.by_count,
         coverage_by_value=coverage.by_value,
+        queued=queued,
     )
 
 

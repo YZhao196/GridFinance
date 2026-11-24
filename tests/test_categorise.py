@@ -3,7 +3,7 @@ from datetime import date
 import pytest
 
 from finance_tool.engine import categorise as cat
-from finance_tool.store.entities import Rule, StoreDocument, Transaction
+from finance_tool.store.entities import Rule, Settings, StoreDocument, Transaction
 from finance_tool.store.store import Store
 
 from fixtures import build_store
@@ -344,3 +344,280 @@ def test_coverage_by_category_includes_the_uncategorised_bucket(view):
 def test_coverage_by_category_is_largest_first(view):
     found = cat.coverage_by_category(view)
     assert list(found) == ["Rent", "Utilities", "Subscriptions", "Uncategorised"]
+
+
+# --------------------------------------------------------------- richer rules
+
+
+def test_equals_compares_the_whole_normalised_text():
+    rule = Rule(id="r", match="COLES NORTHLAND", category="Groceries",
+                match_type="equals")
+    assert cat.rule_matches(rule, "COLES NORTHLAND") is True
+    assert cat.rule_matches(rule, "COLES NORTHLAND VIC") is False
+
+
+def test_regex_searches_the_description_and_merchant():
+    rule = Rule(id="r", match=r"^UBER\s+\*", category="Transport", match_type="regex")
+    assert cat.rule_matches(rule, "UBER * TRIP") is True
+    assert cat.rule_matches(rule, "MY UBER") is False
+
+
+def test_an_invalid_regex_matches_nothing_instead_of_raising():
+    rule = Rule(id="r", match="[", category="Transport", match_type="regex")
+    assert cat.rule_matches(rule, "anything") is False
+
+
+def test_merchant_matches_only_the_merchant_key():
+    rule = Rule(id="r", match="NETFLIX", category="Subscriptions",
+                match_type="merchant")
+    assert cat.rule_matches(rule, "CARD PURCHASE 123456", "NETFLIX") is True
+    assert cat.rule_matches(rule, "NETFLIX.COM 4482", None) is True
+    assert cat.rule_matches(rule, "CARD PURCHASE 123456", "SPOTIFY") is False
+
+
+def test_amount_bounds_compare_the_size_of_the_movement():
+    rule = Rule(id="r", match="COLES", category="Groceries",
+                amount_min=10.0, amount_max=100.0)
+    assert cat.rule_matches(rule, "COLES", amount=-50.0) is True
+    assert cat.rule_matches(rule, "COLES", amount=50.0) is True
+    assert cat.rule_matches(rule, "COLES", amount=-5.0) is False
+    assert cat.rule_matches(rule, "COLES", amount=-150.0) is False
+
+
+def test_an_inactive_rule_matches_nothing():
+    rule = Rule(id="r", match="COLES", category="Groceries", active=False)
+    assert cat.rule_matches(rule, "COLES") is False
+
+
+def test_a_tag_only_rule_annotates_without_shadowing_a_category_rule():
+    tagging = Rule(id="r_tag", match="COLES", category="", tags=["weekly"], priority=50)
+    categorising = Rule(id="r_cat", match="COLES", category="Groceries", priority=1)
+
+    decision = cat.categorise("COLES", [tagging, categorising], count_hit=True)
+
+    assert decision.category == "Groceries"
+    assert decision.tags == ["weekly"]
+    assert tagging.hit_count == 1
+    assert categorising.hit_count == 1
+
+
+def test_a_tag_only_rule_does_not_clear_an_existing_category_on_a_re_run():
+    txn = Transaction(id="t1", date=date(2026, 10, 1), amount=-10.0,
+                      description="COLES", account="a_1", category="Groceries",
+                      category_source="llm")
+    store = _memory_store(txn)
+
+    cat.recategorise_all(store, rules=[Rule(id="r_tag", match="COLES",
+                                            category="", tags=["weekly"])])
+
+    assert txn.category == "Groceries"
+    assert txn.tags == ["weekly"]
+
+
+def test_hit_count_only_moves_when_a_rule_actually_files_a_row():
+    rule = Rule(id="r", match="COLES", category="Groceries")
+    rules = [rule]
+
+    cat.categorise("COLES", rules)
+    assert rule.hit_count == 0
+
+    decision = cat.categorise("COLES", rules, count_hit=True)
+    assert rule.hit_count == 1
+    assert decision.source == "rule"
+    assert decision.confidence == 1.0
+
+
+# --------------------------------------------------------------------- memory
+
+
+def _memory_store(*transactions):
+    return Store(doc=StoreDocument(transactions=list(transactions)),
+                 settings=Settings(), data_dir=None)
+
+
+def _txn(txn_id, category=None, source="", description="ACME PTY", merchant="ACME"):
+    return Transaction(id=txn_id, date=date(2026, 10, 1), amount=-10.0,
+                       description=description, merchant=merchant, account="a_1",
+                       category=category, category_source=source)
+
+
+def test_memory_needs_two_prior_rows_and_sixty_percent_agreement():
+    store = _memory_store(_txn("p1", "Dining & Takeaway", "user"),
+                          _txn("p2", "Dining & Takeaway", "user"),
+                          _txn("t"))
+
+    found = cat.memory_category(store.view(), "ACME PTY", "ACME", exclude_id="t")
+
+    assert found is not None
+    assert found.category == "Dining & Takeaway"
+    assert found.confidence == 0.9
+    assert found.occurrences == 2
+
+
+def test_one_prior_row_is_not_memory():
+    store = _memory_store(_txn("p1", "Dining & Takeaway", "user"), _txn("t"))
+    assert cat.memory_category(store.view(), "ACME PTY", "ACME", exclude_id="t") is None
+
+
+def test_a_split_merchant_is_a_question_not_a_memory():
+    store = _memory_store(_txn("p1", "Dining & Takeaway", "user"),
+                          _txn("p2", "Groceries", "user"),
+                          _txn("t"))
+    assert cat.memory_category(store.view(), "ACME PTY", "ACME", exclude_id="t") is None
+
+
+def test_memory_ignores_the_row_being_classified():
+    store = _memory_store(_txn("t", "Dining & Takeaway", "user"))
+    assert cat.memory_category(store.view(), "ACME PTY", "ACME", exclude_id="t") is None
+
+
+# --------------------------------------------------------------- subscriptions
+
+
+def test_a_regular_merchant_no_seed_knows_is_proposed_as_a_subscription():
+    store = _memory_store(
+        Transaction(id="s1", date=date(2026, 1, 1), amount=-10.0,
+                    description="ZORBULON", merchant="ZORBULON", account="a_1"),
+        Transaction(id="s2", date=date(2026, 2, 1), amount=-10.0,
+                    description="ZORBULON", merchant="ZORBULON", account="a_1"),
+        Transaction(id="s3", date=date(2026, 3, 1), amount=-10.0,
+                    description="ZORBULON", merchant="ZORBULON", account="a_1"),
+    )
+
+    found = cat.suggest_rules(store.view())
+
+    zorbulon = next(s for s in found if s.merchant == "ZORBULON")
+    assert zorbulon.category == "Subscriptions"
+
+
+# ------------------------------------------------------- retro-applying one rule
+
+
+def test_a_rule_reaches_unclaimed_and_model_set_rows_but_not_a_person():
+    untouched = Transaction(id="t1", date=date(2026, 10, 1), amount=-10.0,
+                            description="COLES", account="a_1")
+    modelled = Transaction(id="t2", date=date(2026, 10, 2), amount=-11.0,
+                           description="COLES", account="a_1",
+                           category="Shopping", category_source="llm")
+    personal = Transaction(id="t3", date=date(2026, 10, 3), amount=-12.0,
+                           description="COLES", account="a_1",
+                           category="Shopping", category_source="user")
+    store = _memory_store(untouched, modelled, personal)
+    rule = Rule(id="r", match="COLES", category="Groceries")
+
+    changed = cat.apply_rule_to_history(store, rule)
+
+    assert changed == 2
+    assert untouched.category == "Groceries"
+    assert modelled.category == "Groceries"
+    assert personal.category == "Shopping"
+    assert rule.hit_count == 2
+
+
+def test_accepting_a_suggestion_without_a_category_is_refused(store):
+    suggestion = cat.RuleSuggestion(merchant="ZORBULON", occurrences=2, total=20.0,
+                                    category=None)
+    with pytest.raises(ValueError):
+        cat.accept_suggestion(store, suggestion)
+    assert not any(rule.match == "ZORBULON" for rule in store.doc.rules)
+
+
+def test_memory_ignores_provisional_guesses_and_transfers():
+    provisional = _memory_store(
+        Transaction(id="p1", date=date(2026, 10, 1), amount=-10.0,
+                    description="ACME PTY", merchant="ACME", account="a_1",
+                    category="Housing", category_source="llm", needs_review=True),
+        Transaction(id="p2", date=date(2026, 10, 2), amount=-10.0,
+                    description="ACME PTY", merchant="ACME", account="a_1",
+                    category="Housing", category_source="llm", needs_review=True),
+        _txn("t"))
+    transfer = _memory_store(
+        Transaction(id="p1", date=date(2026, 10, 1), amount=-10.0,
+                    description="ACME PTY", merchant="ACME", account="a_1",
+                    category="Transfers", category_source="detected"),
+        Transaction(id="p2", date=date(2026, 10, 2), amount=-10.0,
+                    description="ACME PTY", merchant="ACME", account="a_1",
+                    category="Transfers", category_source="detected"),
+        _txn("t"))
+
+    assert cat.memory_category(provisional.view(), "ACME PTY", "ACME",
+                               exclude_id="t") is None
+    assert cat.memory_category(transfer.view(), "ACME PTY", "ACME",
+                               exclude_id="t") is None
+
+
+def test_a_legacy_hand_set_category_is_not_overwritten_by_a_rule():
+    legacy = Transaction(id="t1", date=date(2026, 10, 1), amount=-10.0,
+                         description="COLES", account="a_1", category="Mine")
+    store = _memory_store(legacy)
+
+    changed = cat.apply_rule_to_history(
+        store, Rule(id="r", match="COLES", category="Groceries"))
+
+    assert changed == 0
+    assert legacy.category == "Mine"
+
+
+def test_coverage_by_category_does_not_count_transfers_as_spending():
+    store = _memory_store(
+        Transaction(id="t1", date=date(2026, 10, 1), amount=-50.0,
+                    description="COLES", account="a_1", category="Groceries"),
+        Transaction(id="t2", date=date(2026, 10, 2), amount=-100.0,
+                    description="TO SAVINGS", account="a_1", category="Transfers"),
+    )
+
+    assert cat.coverage_by_category(store.view()) == {"Groceries": 50.0}
+
+
+def test_memory_ignores_the_unfiled_bucket():
+    store = _memory_store(
+        _txn("p1", "Uncategorised", "bank"),
+        _txn("p2", "Uncategorised", "bank"),
+        _txn("t"))
+
+    assert cat.memory_category(store.view(), "ACME PTY", "ACME",
+                               exclude_id="t") is None
+
+
+def test_recategorise_corrects_automatic_categories_but_not_a_person():
+    automatic = [
+        Transaction(id="l", date=date(2026, 10, 1), amount=-10.0, description="COLES",
+                    account="a_1", category="Shopping", category_source="llm"),
+        Transaction(id="m", date=date(2026, 10, 2), amount=-10.0, description="COLES",
+                    account="a_1", category="Shopping", category_source="memory"),
+        Transaction(id="b", date=date(2026, 10, 3), amount=-10.0, description="COLES",
+                    account="a_1", category="Shopping", category_source="bank"),
+    ]
+    protected = [
+        Transaction(id="u", date=date(2026, 10, 4), amount=-10.0, description="COLES",
+                    account="a_1", category="Shopping", category_source="user"),
+        Transaction(id="h", date=date(2026, 10, 5), amount=-10.0, description="COLES",
+                    account="a_1", category="Shopping"),
+    ]
+    store = _memory_store(*automatic, *protected)
+
+    cat.recategorise_all(store, rules=[Rule(id="r", match="COLES",
+                                            category="Groceries")])
+
+    assert [txn.category for txn in store.doc.transactions[:3]] == \
+        ["Groceries", "Groceries", "Groceries"]
+    assert [txn.category for txn in store.doc.transactions[3:]] == \
+        ["Shopping", "Shopping"]
+
+
+def test_retro_applying_a_rule_closes_the_questions_it_answers():
+    from finance_tool.engine import review
+
+    store = _memory_store(Transaction(
+        id="t1", date=date(2026, 10, 1), amount=-10.0, description="COLES",
+        account="a_1"))
+    txn = store.view().transaction("t1")
+    review.queue(store, txn)
+    assert review.open_count(store.view()) == 1
+
+    cat.apply_rule_to_history(store, Rule(id="r", match="COLES",
+                                          category="Groceries"))
+
+    assert review.open_count(store.view()) == 0
+    assert txn.category == "Groceries"
+    assert txn.needs_review is False

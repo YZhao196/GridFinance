@@ -57,6 +57,9 @@ ID_PREFIX = {
     "people": "p",
     "snapshots": "s",
     "canvases": "c",
+    "reviews": "rv",
+    "imports": "im",
+    "messages": "cm",
 }
 
 
@@ -222,17 +225,37 @@ class StoreView:
     def roots(self) -> list[Item]:
         return self.children_of(None)
 
-    def account_by_external(self, external_id: str | None) -> Account | None:
+    def account_by_external(self, external_id: str | None,
+                            provider: str | None = None) -> Account | None:
+        """The local account a remote id names, scoped to its feed when one is given.
+
+        External ids are only unique inside a provider, and an account created before
+        providers were recorded has an empty one — that legacy account still matches
+        rather than being orphaned by the upgrade.
+        """
         if external_id is None:
             return None
-        for account in self.doc.accounts:
-            if account.external_id == external_id:
-                return account
-        return None
+        candidates = [account for account in self.doc.accounts
+                      if account.external_id == external_id]
+        if provider:
+            for account in candidates:
+                if account.provider == provider:
+                    return account
+            # Accounts created before providers were recorded came from SimpleFIN, the
+            # only feed the app had. Let that provider claim them; letting every provider
+            # match an empty one is how a colliding id hijacks another bank's account.
+            if provider == "simplefin":
+                for account in candidates:
+                    if not account.provider:
+                        return account
+            return None
+        return candidates[0] if candidates else None
 
     def foreign_accounts(self) -> list[Account]:
         """Accounts whose currency does not match the app's (§22): flagged, never summed."""
-        return [a for a in self.doc.accounts if a.currency and a.currency != self.currency]
+        home = (self.currency or "").strip().upper()
+        return [a for a in self.doc.accounts
+                if a.currency and a.currency.strip().upper() != home]
 
 
 # --------------------------------------------------------------------------- store
@@ -250,7 +273,10 @@ class Store:
         clock: Callable[[], datetime] = datetime.now,
         create: bool = True,
     ) -> None:
-        self.doc = doc if doc is not None else StoreDocument(schema_version=SCHEMA_VERSION)
+        # The document's own schema_version is a codec-era marker, not the database's
+        # version — that is `PRAGMA user_version`, owned by `db.py`. Keeping the marker at
+        # its default means an in-memory document and a reloaded one compare equal.
+        self.doc = doc if doc is not None else StoreDocument()
         self.settings = settings if settings is not None else Settings()
         # None means the store has *no* directory — an in-memory database — rather than
         # "wherever the app keeps its data". Defaulting to the real data directory meant a
@@ -298,7 +324,10 @@ class Store:
         try:
             connection = dbm.connect(self.db_path, create=create)
             if create:
-                dbm.ensure_schema(connection)
+                # SQLite opens a non-database file without complaint and only objects on
+                # the first read. Probe here, so "not a database" takes the recovery path
+                # while a failed migration below keeps its own, non-destructive one.
+                connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
         except sqlite3.DatabaseError as exc:
             if not create:
                 raise
@@ -306,8 +335,6 @@ class Store:
                 # Another process — or a sync client — has the file for a moment. The
                 # answer is to say so and stop, never to move the user's store aside and
                 # carry on with an empty one.
-                if connection is not None:
-                    connection.close()
                 raise dbm.StoreBusyError(
                     "the store is open in another window, or being synced. Close the "
                     "other window and try again — nothing has been changed.") from exc
@@ -316,7 +343,49 @@ class Store:
             if connection is not None:
                 connection.close()
             return self._recover_database(exc)
+
+        if create:
+            try:
+                self._upgrade_schema(connection)
+                dbm.ensure_schema(connection)
+            except sqlite3.DatabaseError as exc:
+                # A migration that failed is not a corrupt store. Moving the file aside
+                # here would turn a recoverable upgrade into the data loss the rest of
+                # this module exists to prevent.
+                connection.close()
+                if dbm.is_busy(exc):
+                    raise dbm.StoreBusyError(
+                        "the store is open in another window, or being synced. Close the "
+                        "other window and try again — nothing has been changed.") from exc
+                raise dbm.StoreDatabaseError(
+                    f"the store's schema could not be upgraded ({exc}). It has been left "
+                    f"at {self.db_path} unchanged; nothing was moved or discarded.") from exc
         return connection
+
+    def _upgrade_schema(self, connection: sqlite3.Connection) -> None:
+        """Bring an older store's tables up to the entities, after keeping a copy.
+
+        The backup comes first and is a real SQLite snapshot, not a file copy: a
+        migration that half-applies is recoverable only if the state before it exists.
+        """
+        if dbm.schema_version(connection) > dbm.SCHEMA_VERSION:
+            return
+        pending = dbm.missing_columns(connection)
+        if pending and self.db_path is not None and self.db_path.exists():
+            self.backups_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                history.capture(connection, self.backups_dir, when=self._clock(),
+                                reason="pre-migration")
+            except OSError as exc:
+                raise dbm.StoreDatabaseError(
+                    f"the store needs a schema upgrade, but a pre-migration backup could "
+                    f"not be written ({exc}). Nothing has been changed.") from exc
+        added = dbm.upgrade_schema(connection)
+        if added:
+            self.notes.append(
+                f"the store was upgraded to schema v{dbm.SCHEMA_VERSION} "
+                f"({len(added)} column(s) added); a copy of the previous state is in "
+                "data/backups/.")
 
     def _recover_database(self, exc: Exception) -> sqlite3.Connection:
         """Set an unreadable database aside and start again.
@@ -325,7 +394,7 @@ class Store:
         subsequent open, so there would be nothing to recover from either. Losing data
         silently is the one forbidden move — hence the note, and the copy in `backups/`.
         """
-        self.doc = StoreDocument(schema_version=SCHEMA_VERSION)
+        self.doc = StoreDocument()
         self.settings = Settings()
         self.read_only = False
         held = getattr(self, "_conn", None)
@@ -447,15 +516,20 @@ class Store:
     def _read(self) -> None:
         """Load the document and settings. A corrupt file is set aside and reported."""
         try:
-            document = StoreDocument(schema_version=SCHEMA_VERSION)
+            document = StoreDocument()
             for table in dbm.TABLES:
-                setattr(document, table, dbm.read_all(self._conn, table))
-            settings = dbm.read_settings(self._conn)
+                # A table added by a newer build is simply absent in an older store read
+                # read-only; leaving the attribute empty is the honest answer and keeps
+                # the rest of the document readable.
+                if dbm.table_exists(self._conn, table):
+                    setattr(document, table, dbm.read_all(self._conn, table))
+            settings = (dbm.read_settings(self._conn)
+                        if dbm.table_exists(self._conn, dbm.SETTINGS_TABLE) else None)
         except sqlite3.DatabaseError as exc:
             if self.read_only:
                 # Read-only may not write, so the file is reported and left alone. It is
                 # still untouched, which is the part that matters.
-                self.doc = StoreDocument(schema_version=SCHEMA_VERSION)
+                self.doc = StoreDocument()
                 self.settings = Settings()
                 if dbm.is_busy(exc):
                     raise dbm.StoreBusyError(
@@ -473,12 +547,20 @@ class Store:
 
         self.doc = document
         self.settings = settings if settings is not None else Settings()
-        self._generation = dbm.read_generation(self._conn)
+        # A read-only load of a store that does not exist is an empty in-memory database,
+        # which has no meta table; it is a blank store, not a damaged one.
+        self._generation = (dbm.read_generation(self._conn)
+                            if dbm.table_exists(self._conn, dbm.META_TABLE) else 0)
         version = dbm.schema_version(self._conn)
         if version > dbm.SCHEMA_VERSION:
             self.notes.append(
                 f"the store is schema v{version}, newer than this build "
                 f"(v{dbm.SCHEMA_VERSION}). It has been left untouched.")
+        elif 0 < version < dbm.SCHEMA_VERSION:
+            self.notes.append(
+                f"the store is schema v{version}, older than this build "
+                f"(v{dbm.SCHEMA_VERSION}); it has been read without upgrading. Open it "
+                "in the app to migrate it.")
 
     def backup(self, reason: str = "manual") -> Path | None:
         """Snapshot the store beside it. Called before any migration (§12).

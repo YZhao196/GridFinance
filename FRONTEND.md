@@ -453,3 +453,32 @@ Genuinely open:
 3. **Whether the tray is a bar or a panel.** §27 says a bottom tray. Nothing depends on it.
 4. **The exact empty states.** Each widget needs prose for "nothing here yet", and good
    prose is a writing job, not a layout one. The rule is only: explain, never blank.
+
+---
+
+## 11. Backend features with no surface yet
+
+The backend now carries every user-facing feature of the former AI Finance Manager
+(`BACKEND.md` §10). None of them has a screen. This section lists them so the redesign
+picks them up; it deliberately does **not** design those surfaces.
+
+| Capability | What the backend provides | What the frontend must eventually decide |
+|---|---|---|
+| **Assistant chat** | `assistant/chat.py`: send a turn, history, clear; `ChatMessage` stores raw markdown, `thinking` and the provider's raw blocks. 15 tools, writes gated by `Settings.ai_writes`. | Where chat lives (popout, rail entry, third pane); markdown rendering; a way to show or hide stored thinking. Assistant text must render bold, italics, lists and code — never literal asterisks — and thinking must be viewable. |
+| **Statement import and inbox** | `engine/intake.py`: import one file, scan `data/statements/inbox/`, move to `processed/`; `ImportRecord` history including failures; PARSE warnings and skipped rows. | File picking and drag-drop; the import summary ("412 read, 7 skipped"); a history surface; what to do with a file that failed to parse. |
+| **Live feeds and credentials** | `engine/feeds.py`, `engine/sync.py`, `Secrets`, `llm/factory.py`: provider selection, key entry, `provider_status`, `test_key`, reconnect-required states. | Provider and model settings; key entry with no plaintext echo; a sync-now action; explicit failure states. |
+| **Categorisation and review** | `engine/classify.py`, `engine/review.py`, `categorise.py`: rules, merchant memory, LLM classification, the persistent queue, suggestion acceptance and make-rule. | The review dialog's contents (question, options, suggestion, skip, make-rule) and where uncategorised rows are surfaced. The `uncategorised_review` hook already counts open and queued items. |
+| **Transfers** | `engine/transfers.py`: detect and file pairs, never over a user or rule category. | Whether detection runs automatically or on request, and how a filed transfer is shown or undone. |
+| **Exports and profile** | `engine/exports.py`: FY markdown into `data/exports/`, `profile.md`. | An export action and a way to read/edit the profile. |
+| **Read-only SQL** | `query.py`: one SELECT/WITH, read-only connection, schema help. | Whether it is an advanced popout or palette-only; how results are shown and copied. |
+| **Local API and MCP** | `httpapi.py` (loopback, PIN-gated), `mcp_server.py` (stdio). | Not UI: these are integration surfaces. If Settings grows a section for them, it needs only on/off state and the PIN, never a key display. |
+| **PIN** | `secrets.app_pin_hash`, `httpapi.hash_pin`. | Where a PIN is set or removed; the API's login surface belongs to the API, not the canvas. |
+| **AFM migration** | `scripts/migrate_afm.py`, with `--dry-run` and `--force`. | Whether onboarding offers it; otherwise it stays a command-line step documented in `README.md`. |
+
+Two rules for whoever builds these:
+
+- **They are ordinary surfaces, not a second app.** The chrome rules in §2 and the popout
+  rule in §27 still apply: no menubar, no second settings dialog, no eager button.
+- **The backend already computes every figure and enforces every gate.** The frontend asks,
+  renders what it is given, and never recomputes a total, a category decision or a
+  permission.

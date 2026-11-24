@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 
+from finance_tool.engine import categories as cats
 from finance_tool.engine import detect as det
 from finance_tool.store.entities import Rule, Transaction
 from finance_tool.store.store import StoreView, new_id
@@ -116,27 +117,56 @@ def order_rules(rules: list[Rule]) -> list[Rule]:
 SHORT_KEYWORD = 5
 
 
-def rule_matches(rule: Rule, description: str, merchant: str | None = None) -> bool:
-    """A rule matches a description as a substring, case-insensitively.
+def _normalise(text: str | None) -> str:
+    return " ".join(str(text or "").split()).casefold()
 
-    It also matches the merchant key, so a rule written against the normalised identity
-    ("NETFLIX") keeps working however the bank pads the line ("NETFLIX.COM 4482").
 
-    A keyword shorter than five characters must stand on its own as a word: "bp" is a
-    fuel brand, but as a bare substring it also matches "subprime", and a rule that
-    silently re-categorises unrelated spending is the kind of quiet wrongness this app
-    exists to avoid.
+def rule_matches(rule: Rule, description: str, merchant: str | None = None, *,
+                 amount: float | None = None) -> bool:
+    """Whether a rule claims a row.
+
+    ``contains`` keeps the old behaviour — a substring, with keywords shorter than five
+    characters required to stand on their own as words. ``equals`` compares the whole
+    normalised text, ``regex`` searches it, and ``merchant`` compares only the merchant
+    key so a rule does not accidentally match a reference number or a memo.
+
+    Amount bounds compare magnitude: "$5–$200" means the size of the movement, not its
+    sign. An invalid regex matches nothing rather than raising.
     """
-    needle = (rule.match or "").strip().casefold()
+    if not rule.active:
+        return False
+    if amount is not None:
+        magnitude = abs(float(amount))
+        if rule.amount_min is not None and magnitude < rule.amount_min:
+            return False
+        if rule.amount_max is not None and magnitude > rule.amount_max:
+            return False
+
+    pattern = (rule.match or "").strip()
+    needle = pattern.casefold()
     if not needle:
         return False
+    key = det.merchant_key(merchant if merchant is not None else description).casefold()
+    kind = (rule.match_type or "contains").casefold()
+
+    if kind == "merchant":
+        return needle in key
+    if kind == "regex":
+        haystack = f"{description or ''} {merchant or ''}"
+        try:
+            return re.search(pattern, haystack, re.IGNORECASE) is not None
+        except re.error:
+            return False
+    if kind == "equals":
+        return _normalise(description) == _normalise(pattern) or key == needle
+
     haystack = (description or "").casefold()
     if len(needle) >= SHORT_KEYWORD:
         if needle in haystack:
             return True
     elif re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", haystack):
         return True
-    return merchant is not None and needle == merchant.casefold()
+    return needle == key
 
 
 @dataclass(frozen=True)
@@ -145,6 +175,8 @@ class Decision:
     tags: list[str] = field(default_factory=list)
     rule_id: str | None = None
     matched: str | None = None
+    source: str = ""
+    confidence: float | None = None
 
     @property
     def categorised(self) -> bool:
@@ -159,13 +191,33 @@ def categorise(
     rules: list[Rule],
     *,
     merchant: str | None = None,
+    amount: float | None = None,
+    count_hit: bool = False,
 ) -> Decision:
-    """The first rule that matches wins — user rules first, then the seeded defaults."""
-    key = merchant if merchant is not None else det.merchant_key(description)
+    """The first matching active rule wins — user rules first, then seeded defaults.
+
+    ``count_hit`` is off by default because asking "would a rule match this?" is not the
+    same as applying it; import and the classifier turn it on for rows they actually file.
+    """
+    carried_tags: list[str] = []
     for rule in order_rules(rules):
-        if rule_matches(rule, description, key):
-            return Decision(category=rule.category or None, tags=list(rule.tags),
-                            rule_id=rule.id, matched=rule.match)
+        if not rule_matches(rule, description, merchant, amount=amount):
+            continue
+        if rule.category:
+            tags = list(dict.fromkeys(carried_tags + list(rule.tags)))
+            if count_hit:
+                rule.hit_count += 1
+            return Decision(category=rule.category, tags=tags,
+                            rule_id=rule.id, matched=rule.match, source="rule",
+                            confidence=1.0)
+        if rule.tags:
+            # A rule with tags but no category is a note, not a decision: collect it and
+            # keep looking. Letting it stop the search would shadow every rule below.
+            carried_tags.extend(rule.tags)
+            if count_hit:
+                rule.hit_count += 1
+    if carried_tags:
+        return Decision(tags=list(dict.fromkeys(carried_tags)), source="rule")
     return UNCLEAR
 
 
@@ -173,7 +225,109 @@ def categorise_many(
     transactions: list[Transaction],
     rules: list[Rule],
 ) -> list[tuple[Transaction, Decision]]:
-    return [(txn, categorise(txn.description, rules)) for txn in transactions]
+    return [(txn, categorise(txn.description, rules, merchant=txn.merchant,
+                             amount=txn.amount)) for txn in transactions]
+
+
+# --------------------------------------------------------------------- memory
+
+MEMORY_MIN_OCCURRENCES = 2
+MEMORY_AGREEMENT = 0.60
+MEMORY_CONFIDENCE = 0.9
+
+
+@dataclass(frozen=True)
+class MemoryDecision:
+    category: str
+    confidence: float
+    occurrences: int
+    agreement: float
+
+
+def memory_category(view: StoreView, description: str, merchant: str | None = None, *,
+                    exclude_id: str | None = None) -> MemoryDecision | None:
+    """What this merchant was called before, when the history is decisive.
+
+    Two prior rows and 60% agreement is the bar. Below it the answer is "ask", not "guess":
+    a merchant split across two categories is exactly the case a person should settle.
+    """
+    key = det.merchant_key(merchant if merchant is not None else description).casefold()
+    if not key:
+        return None
+    counts: dict[str, int] = {}
+    total = 0
+    for txn in view.transactions:
+        if txn.id == exclude_id or not txn.category or txn.date is None:
+            continue
+        # A provisional model guess is not evidence, a transfer is a movement of the
+        # user's own money rather than a merchant's identity, and "Uncategorised" is
+        # the absence of an answer, not one.
+        if (txn.needs_review or cats.is_transfer(txn.category)
+                or txn.category == cats.UNCATEGORISED):
+            continue
+        txn_key = det.merchant_key(
+            txn.merchant if txn.merchant is not None else txn.description).casefold()
+        if txn_key != key:
+            continue
+        counts[txn.category] = counts.get(txn.category, 0) + 1
+        total += 1
+    if not counts or total == 0:
+        return None
+    top, count = max(counts.items(), key=lambda pair: (pair[1], pair[0]))
+    agreement = count / total
+    if count < MEMORY_MIN_OCCURRENCES or agreement < MEMORY_AGREEMENT:
+        return None
+    return MemoryDecision(category=top, confidence=MEMORY_CONFIDENCE,
+                          occurrences=count, agreement=agreement)
+
+
+def _close_reviews(store, transaction_id: str, category: str | None,
+                   now: datetime | None = None) -> None:
+    """Settle any open question about a row a rule or a re-run just decided.
+
+    Kept here as a direct walk of the review list rather than an import of
+    :mod:`finance_tool.engine.review`, which imports this module: the alternative is a
+    cycle for one loop.
+    """
+    moment = now or datetime.now()
+    changed = 0
+    for item in store.doc.reviews:
+        if item.transaction_id != transaction_id or item.status != "open":
+            continue
+        item.status = "resolved"
+        item.resolved_category = category or ""
+        item.resolved_at = moment
+        changed += 1
+    if changed:
+        store.version += 1
+
+
+def apply_rule_to_history(store, rule: Rule, *, now: datetime | None = None) -> int:
+    """Retro-apply one rule to rows no rule or person has already claimed."""
+    if not rule.category:
+        # A rule with no category is a grouping note, not a decision.
+        return 0
+    changed = 0
+    auto_sources = {"llm", "memory", "bank"}
+    for txn in store.doc.transactions:
+        # A category with no source is a hand-set category (legacy or edited) and is as
+        # protected here as it is in recategorise_all.
+        if txn.category and txn.category_source not in auto_sources:
+            continue
+        if not rule_matches(rule, txn.description, txn.merchant, amount=txn.amount):
+            continue
+        txn.category = rule.category or None
+        txn.tags = list(rule.tags)
+        txn.rule_id = rule.id
+        txn.category_source = "rule"
+        txn.category_confidence = 1.0
+        txn.needs_review = False
+        _close_reviews(store, txn.id, rule.category, now)
+        rule.hit_count += 1
+        changed += 1
+    if changed:
+        store.version += 1
+    return changed
 
 
 def uncategorised(transactions: list[Transaction]) -> list[Transaction]:
@@ -225,17 +379,24 @@ def suggest_rules(
     """
     groups = det.group_by_merchant(uncategorised(list(view.transactions)))
     seeds = seed_rules()
+    # A regular merchant the ledger does not otherwise recognise is a subscription even
+    # when no keyword in the seed table names it. The proposal is still only a proposal.
+    recurring = {charge.merchant
+                 for charge in det.detect_subscriptions(view, min_occurrences=3)}
 
     found: list[RuleSuggestion] = []
     for merchant, txns in groups.items():
         if len(txns) < min_occurrences:
             continue
         decision = categorise(txns[0].description, seeds, merchant=merchant)
+        category = decision.category
+        if category is None and merchant in recurring:
+            category = "Subscriptions"
         found.append(RuleSuggestion(
             merchant=merchant,
             occurrences=len(txns),
             total=sum(abs(t.amount) for t in txns),
-            category=decision.category,
+            category=category,
             tags=list(decision.tags),
             sample=txns[0].description,
             transaction_ids=[t.id for t in txns],
@@ -258,7 +419,7 @@ def suggestions_summary(view: StoreView, *, min_occurrences: int = 2) -> str:
 
 
 def recategorise_all(store, *, rules: list[Rule] | None = None, overwrite: bool = True,
-                     protect_manual: bool = True) -> int:
+                     protect_manual: bool = True, now: datetime | None = None) -> int:
     """Re-run the rules over every transaction. Returns how many changed.
 
     ``overwrite`` defaults on because that is what "re-run categorisation" means: a rule
@@ -275,14 +436,35 @@ def recategorise_all(store, *, rules: list[Rule] | None = None, overwrite: bool 
     for txn in store.doc.transactions:
         if txn.category and not overwrite:
             continue
-        if protect_manual and txn.category and txn.rule_id is None:
+        if (protect_manual and txn.category and txn.rule_id is None
+                and txn.category_source not in {"llm", "memory", "bank"}):
+            # A person's category is protected. An automatic one — the model, memory,
+            # a bank hint — is exactly what re-running the rules is for.
             continue
-        decision = categorise(txn.description, chosen)
+        decision = categorise(txn.description, chosen, merchant=txn.merchant,
+                              amount=txn.amount)
+        if decision.category is None and decision.source == "rule":
+            # A tag-only match annotates; it does not answer the category question, so
+            # it must not clear one a category rule already gave.
+            if txn.tags != decision.tags:
+                txn.tags = list(decision.tags)
+                changed += 1
+            continue
         if (txn.category, txn.tags, txn.rule_id) != (decision.category, decision.tags,
                                                      decision.rule_id):
             txn.category = decision.category
             txn.tags = list(decision.tags)
             txn.rule_id = decision.rule_id
+            txn.category_source = "rule" if decision.rule_id else ""
+            txn.category_confidence = 1.0 if decision.rule_id else None
+            if decision.rule_id:
+                for rule in chosen:
+                    if rule.id == decision.rule_id:
+                        rule.hit_count += 1
+                        break
+            if decision.category:
+                _close_reviews(store, txn.id, decision.category, now)
+                txn.needs_review = False
             changed += 1
     if changed:
         store.version += 1
@@ -291,12 +473,17 @@ def recategorise_all(store, *, rules: list[Rule] | None = None, overwrite: bool 
 
 def accept_suggestion(store, suggestion: RuleSuggestion, *, category: str | None = None) -> Rule:
     """Write a suggestion as a real rule and re-run categorisation (§24)."""
+    chosen = category if category is not None else (suggestion.category or "")
+    if not str(chosen).strip():
+        raise ValueError("choose a category before accepting this suggestion")
     rule = Rule(
         id=new_id("rules"),
         match=suggestion.merchant,
-        category=category if category is not None else (suggestion.category or ""),
+        category=str(chosen),
         tags=list(suggestion.tags),
         priority=10,
+        name=suggestion.merchant,
+        match_type="contains",
     )
     store.doc.rules.append(rule)
     recategorise_all(store, rules=store.doc.rules, overwrite=False)
@@ -334,6 +521,8 @@ def coverage_by_category(view: StoreView, start: date | None = None,
     bucket: dict[str, float] = {}
     for txn in view.transactions:
         if txn.amount >= 0 or txn.date is None:
+            continue
+        if cats.is_transfer(txn.category):
             continue
         if start is not None and txn.date < start:
             continue

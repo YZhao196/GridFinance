@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Sequence
 
+from finance_tool.engine import categories as cats
+from finance_tool.engine import detect as det
 from finance_tool.engine import periods as per
 from finance_tool.engine import recurrence as rec
 from finance_tool.engine.ledger import (
@@ -471,8 +473,10 @@ def liquid_balance(view: StoreView) -> float:
 
 
 def _matches_currency(view: StoreView, account) -> bool:
-    """§22: a non-matching account is flagged, never summed."""
-    return not account.currency or account.currency == view.currency
+    """§22: a non-matching account is flagged, never summed. Codes are case-insensitive."""
+    if not account.currency:
+        return True
+    return account.currency.strip().upper() == (view.currency or "").strip().upper()
 
 
 @dataclass(frozen=True)
@@ -643,6 +647,8 @@ def _actual_sides(view: StoreView, span: DateRange) -> tuple[list[tuple[str, flo
     income: dict[str, float] = {}
     spending: dict[str, float] = {}
     for txn in inside:
+        if cats.is_transfer(txn.category):
+            continue
         key = txn.category or (UNCATEGORISED if txn.amount < 0 else "Income")
         if txn.amount >= 0:
             income[key] = income.get(key, 0.0) + txn.amount
@@ -670,11 +676,37 @@ def spend_by_category(
     return targets[:limit] if limit else targets
 
 
+def top_merchants(view: StoreView, span: DateRange, *,
+                  limit: int = 0) -> list[tuple[str, float, int]]:
+    """Spend per merchant key, largest first, with the transaction count.
+
+    Transfers are movement of the user's own money and are excluded, as they are from
+    every other spending figure.
+    """
+    bucket: dict[str, list[float]] = {}
+    for txn in view.transactions:
+        if txn.date is None or not (span[0] <= txn.date <= span[1]) or txn.amount >= 0:
+            continue
+        if cats.is_transfer(txn.category):
+            continue
+        key = det.merchant_key(txn.merchant or txn.description)
+        if not key:
+            continue
+        entry = bucket.setdefault(key, [0.0, 0])
+        entry[0] += abs(txn.amount)
+        entry[1] += 1
+    found = [(key, total, int(count)) for key, (total, count) in bucket.items()]
+    found.sort(key=lambda row: (-row[1], row[0]))
+    return found[:limit] if limit else found
+
+
 def spend_by_tag(view: StoreView, span: DateRange, *, limit: int = 0) -> list[tuple[str, float]]:
     """Spend grouped by transaction tag (§29). An untagged transaction is omitted."""
     bucket: dict[str, float] = {}
     for txn in view.transactions:
         if txn.date is None or not (span[0] <= txn.date <= span[1]) or txn.amount >= 0:
+            continue
+        if cats.is_transfer(txn.category):
             continue
         for tag in txn.tags:
             bucket[tag] = bucket.get(tag, 0.0) + abs(txn.amount) / len(txn.tags)
@@ -691,6 +723,8 @@ def daily_spend(view: StoreView, span: DateRange) -> list[tuple[date, float]]:
     totals: dict[date, float] = {day: 0.0 for day in per.each_day(*span)}
     for txn in view.transactions:
         if txn.date is None or not (span[0] <= txn.date <= span[1]) or txn.amount >= 0:
+            continue
+        if cats.is_transfer(txn.category):
             continue
         totals[txn.date] = totals.get(txn.date, 0.0) + abs(txn.amount)
     return sorted(totals.items())

@@ -490,13 +490,26 @@ def test_no_accounts_at_all_is_a_warning_not_a_silence(store):
     result, _ = sync_once(store, payload())
     assert result.ok is True
     assert result.accounts == 0
-    assert result.warnings == ["the bridge returned no accounts"]
+    assert result.warnings == ["the feed returned no accounts"]
 
 
 def test_a_sync_that_finds_nothing_new_says_so_plainly(store):
     result, _ = sync_once(store, payload(account(transactions=[])))
     assert result.ok is True
     assert result.describe() == "0 read, 0 new"
+
+
+def test_run_sync_honours_include_pending(store, secrets):
+    store.settings.feed_include_pending = True
+    data = payload(account(transactions=[
+        txn("p1", date(2026, 9, 30), -10.00, "PENDING COFFEE", pending=True),
+        txn("t1", date(2026, 9, 1), -520.00, "RENT PAYMENT"),
+    ]))
+
+    result = sy.run_sync(store, secrets, today=date(2026, 10, 7),
+                         transport=StubTransport(respond_json(data)))
+
+    assert result.imported == 2
 
 
 def test_run_sync_reads_the_credential_from_secrets(store, secrets):
@@ -552,6 +565,51 @@ def test_two_accounts_roll_into_one_summary(store):
     assert result.imported == 2
     assert result.summary.categorised == 2
     assert set(result.marks) == {"acc-1", "acc-2"}
+
+
+def test_a_missing_balance_does_not_zero_a_known_account(store):
+    store.view().account("a_everyday").external_id = "acc-1"
+    store.view().account("a_everyday").balance = 500.0
+    data = payload({"id": "acc-1", "name": "Everyday", "currency": "AUD",
+                    "transactions": []})
+
+    result, _ = sync_once(store, data)
+
+    assert result.ok is True
+    assert store.view().account("a_everyday").balance == 500.0
+    assert not any("did not report a balance" in warning for warning in result.warnings)
+
+
+def test_an_empty_account_records_that_it_was_read(store):
+    result, _ = sync_once(store, payload(account(transactions=[])))
+    assert result.ok is True
+    local = store.view().account_by_external("acc-1")
+    assert local.high_water == epoch(date(2026, 10, 7))
+
+    _, second = sync_once(store, payload(account(transactions=[])))
+    assert f"start-date={epoch(date(2026, 10, 2))}" in second.last.url
+
+
+def test_a_lowercase_currency_is_not_treated_as_foreign(store):
+    data = payload(account(currency="aud", transactions=[
+        txn("t1", date(2026, 9, 1), -520.00, "RENT PAYMENT")]))
+
+    result, _ = sync_once(store, data)
+
+    assert result.imported == 1
+    assert result.skipped_accounts == []
+
+
+def test_simplefin_pending_rows_are_counted(store):
+    data = payload(account(transactions=[
+        txn("p1", date(2026, 9, 30), -10.00, "PENDING COFFEE", pending=True),
+        txn("t1", date(2026, 9, 1), -520.00, "RENT PAYMENT"),
+    ]))
+
+    result, _ = sync_once(store, data)
+
+    assert result.imported == 1
+    assert any("1 pending" in warning for warning in result.warnings)
 
 
 def test_sync_never_touches_the_plan(store):

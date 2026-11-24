@@ -242,6 +242,8 @@ class RemoteTransaction:
     posted_epoch: int = 0
     pending: bool = False
     transacted_at: int = 0
+    merchant: str | None = None
+    category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -249,8 +251,12 @@ class RemoteAccount:
     id: str
     name: str = ""
     currency: str = ""
-    balance: float = 0.0
+    balance: float | None = None
     transactions: list[RemoteTransaction] = field(default_factory=list)
+    account_type: str = ""
+    masked: str = ""
+    available: float | None = None
+    connection_id: str | None = None
 
     @property
     def latest_epoch(self) -> int:
@@ -262,10 +268,28 @@ class FetchResult:
     accounts: list[RemoteAccount] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    # Per-account failures from a feed that otherwise worked. A whole-feed failure is a
+    # SyncError; these are the accounts inside it that could not be read.
+    errors: list[str] = field(default_factory=list)
+    failed_ids: list[str] = field(default_factory=list)
+    skipped_pending: int = 0
+    provider: str = ""
 
     @property
     def transactions(self) -> int:
         return sum(len(a.transactions) for a in self.accounts)
+
+
+def _date_epoch(when: date) -> int:
+    return int(datetime(when.year, when.month, when.day, tzinfo=timezone.utc).timestamp())
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "pending"}
+    return bool(value)
 
 
 def epoch_to_date(epoch: Any) -> date | None:
@@ -286,10 +310,7 @@ def parse_amount(value: Any) -> float | None:
     """SimpleFIN amounts arrive as strings and are already signed the app's way."""
     if value is None or value == "":
         return None
-    try:
-        return float(str(value).replace(",", ""))
-    except ValueError:
-        return None
+    return imp.parse_amount(str(value))
 
 
 def parse_accounts(payload: dict[str, Any], *, include_pending: bool = False) -> FetchResult:
@@ -301,6 +322,7 @@ def parse_accounts(payload: dict[str, Any], *, include_pending: bool = False) ->
 
     parsed: list[RemoteAccount] = []
     skipped = 0
+    skipped_pending = 0
     for entry in accounts:
         if not isinstance(entry, dict) or not entry.get("id"):
             skipped += 1
@@ -314,8 +336,9 @@ def parse_accounts(payload: dict[str, Any], *, include_pending: bool = False) ->
             if amount is None:
                 skipped += 1
                 continue
-            pending = bool(row.get("pending"))
+            pending = _truthy(row.get("pending"))
             if pending and not include_pending:
+                skipped_pending += 1
                 continue
             posted_epoch = row.get("posted") or row.get("transacted_at") or 0
             transactions.append(RemoteTransaction(
@@ -328,18 +351,21 @@ def parse_accounts(payload: dict[str, Any], *, include_pending: bool = False) ->
                 transacted_at=int(row.get("transacted_at") or 0),
             ))
 
-        balance = parse_amount(entry.get("balance")) or 0.0
+        # An unreadable or missing balance is unknown, not zero: writing 0.0 would
+        # silently drop the account's money out of net worth.
+        balance = parse_amount(entry.get("balance"))
         parsed.append(RemoteAccount(
             id=str(entry["id"]),
             name=str(entry.get("name") or entry.get("id")),
-            currency=str(entry.get("currency") or ""),
+            currency=str(entry.get("currency") or "").upper(),
             balance=balance,
             transactions=transactions,
         ))
 
     if skipped:
         warnings.append(f"{skipped} rows from the bridge could not be read")
-    return FetchResult(accounts=parsed, warnings=warnings, raw=payload)
+    return FetchResult(accounts=parsed, warnings=warnings, raw=payload,
+                       skipped_pending=skipped_pending, provider="simplefin")
 
 
 def fetch_accounts(
@@ -365,12 +391,37 @@ def fetch_accounts(
 # --------------------------------------------------------------------------- gating
 
 
+FEED_PROVIDERS = ("simplefin", "redbark", "banksync")
+
+
+def provider_for(view: StoreView, secrets: Secrets | None = None,
+                 wanted: str | None = None) -> str:
+    """Which live feed to use: explicit, then stored, then whichever key exists."""
+    if wanted:
+        name = wanted.strip().lower()
+        return name if name in FEED_PROVIDERS else ""
+    stored = (view.settings.feed_provider or "").strip().lower()
+    if stored in FEED_PROVIDERS:
+        return stored
+    if secrets is None:
+        return ""
+    # SimpleFIN first for continuity with stores configured before other feeds existed.
+    if secrets.has("simplefin_access_url"):
+        return "simplefin"
+    if secrets.has("feed_redbark"):
+        return "redbark"
+    if secrets.has("feed_banksync"):
+        return "banksync"
+    return ""
+
+
 def sync_enabled(view: StoreView, secrets: Secrets | None = None) -> bool:
     """Off by default, so file import remains the always-on path (§22)."""
-    enabled = bool(view.settings.enable_bank_sync)
-    if secrets is not None and not secrets.has("simplefin_access_url"):
+    if not view.settings.enable_bank_sync:
         return False
-    return enabled
+    if secrets is None:
+        return True
+    return bool(provider_for(view, secrets))
 
 
 # -------------------------------------------------------------------------- the sync
@@ -388,6 +439,8 @@ class SyncResult:
     warnings: list[str] = field(default_factory=list)
     marks: dict[str, int] = field(default_factory=dict)
     settled: int = 0
+    provider: str = ""
+    failed_accounts: int = 0
 
     @property
     def needs_reconnect(self) -> bool:
@@ -403,29 +456,242 @@ class SyncResult:
         parts = [self.summary.describe()]
         if self.settled:
             parts.append(f"{self.settled} marked paid")
+        if self.failed_accounts:
+            parts.append(f"{self.failed_accounts} account(s) failed")
         if self.skipped_accounts:
             parts.append(f"{len(self.skipped_accounts)} account(s) skipped")
         return "; ".join(parts)
 
 
-def _local_account(store, remote: RemoteAccount) -> Account:
-    existing = store.view().account_by_external(remote.id)
-    if existing is not None:
-        existing.name = remote.name or existing.name
+def _unlinked_match(store, remote: RemoteAccount) -> Account | None:
+    """A manually created account this remote account probably is.
+
+    A statement-first user has an account with no external id; matching it by masked
+    number, then by name, avoids a second copy of the same money. Only an unambiguous
+    match is adopted — two candidate accounts is a question, not a guess.
+    """
+    candidates = [
+        account for account in store.view().accounts
+        if not account.external_id
+        and (not account.currency or not remote.currency
+             or account.currency.strip().upper() == remote.currency.strip().upper())
+        # Two different masked numbers are two different accounts, whatever the names.
+        and not (account.masked and remote.masked and account.masked != remote.masked)
+    ]
+    if remote.masked:
+        matches = [account for account in candidates
+                   if account.masked and account.masked == remote.masked]
+        if len(matches) == 1:
+            return matches[0]
+    if remote.name:
+        matches = [account for account in candidates
+                   if account.name.casefold() == remote.name.casefold()]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _local_account(store, remote: RemoteAccount, provider: str, today: date,
+                   *, update_balance: bool = True) -> Account:
+    existing = store.view().account_by_external(remote.id, provider=provider)
+    changed = False
+    if existing is None:
+        existing = _unlinked_match(store, remote)
+        if existing is None:
+            balance = (remote.balance if update_balance and remote.balance is not None
+                       else None)
+            return store.add("accounts", Account(
+                id=new_id("accounts"), name=remote.name,
+                kind=remote.account_type or "transaction",
+                balance=balance if balance is not None else 0.0,
+                balance_as_of=today if balance is not None else None,
+                currency=remote.currency, external_id=remote.id, provider=provider,
+                masked=remote.masked,
+            ))
+        existing.external_id = remote.id
+        existing.provider = provider
+        changed = True
+
+    # Names, kinds and masked numbers are the user's to rename; the feed fills them
+    # only when they are empty. The balance is the feed's to state, but never over a
+    # figure dated later than the feed's reading, and never into another currency.
+    if remote.name and not existing.name:
+        existing.name = remote.name
+        changed = True
+    newer = existing.balance_as_of is None or today >= existing.balance_as_of
+    if (update_balance and remote.balance is not None
+            and existing.balance != remote.balance and newer):
         existing.balance = remote.balance
-        return existing
-    return store.add("accounts", Account(
-        id=new_id("accounts"), name=remote.name, kind="transaction",
-        balance=remote.balance, currency=remote.currency, external_id=remote.id,
-    ))
+        existing.balance_as_of = today
+        changed = True
+    if remote.currency and not existing.currency:
+        existing.currency = remote.currency
+        changed = True
+    if remote.account_type and not existing.kind:
+        existing.kind = remote.account_type
+        changed = True
+    if remote.masked and not existing.masked:
+        existing.masked = remote.masked
+        changed = True
+    if not existing.provider:
+        existing.provider = provider
+        changed = True
+    if changed:
+        # Account figures feed net worth, so a hook cache keyed on store.version must
+        # notice a balance that moved.
+        store.version += 1
+    return existing
 
 
-def _since_for(store, remote_id: str, *, today: date, lookback_days: int) -> date:
-    account = store.view().account_by_external(remote_id)
+def _since_for(store, remote_id: str, *, provider: str | None = None,
+               today: date, lookback_days: int) -> date:
+    account = store.view().account_by_external(remote_id, provider=provider)
     if account is None or not account.high_water:
         return today - timedelta(days=lookback_days)
     marked = epoch_to_date(account.high_water) or today
     return marked - timedelta(days=OVERLAP_DAYS)
+
+
+def _start_for(store, provider: str, *, today: date, lookback_days: int) -> date:
+    """The earliest window any account of this provider needs.
+
+    Scoped to the provider: an account from a different feed must not drag this feed's
+    start date backwards.
+    """
+    marks = [
+        _since_for(store, account.external_id, provider=provider, today=today,
+                   lookback_days=lookback_days)
+        for account in store.view().accounts
+        if account.external_id
+        and (account.provider == provider
+             or (not account.provider and provider == "simplefin"))
+    ]
+    return min(marks) if marks else today - timedelta(days=lookback_days)
+
+
+def apply_fetch(
+    store,
+    fetched: FetchResult,
+    *,
+    provider: str,
+    today: date,
+    imported_at: datetime | None = None,
+    rules: list[Rule] | None = None,
+) -> SyncResult:
+    """Put a feed's accounts and rows through the import pipeline.
+
+    This is the half every provider shares: currency policy, account upsert, the
+    high-water mark, and the promise that an undated row is counted rather than dropped.
+    """
+    currency = (store.settings.currency or "").strip().upper()
+    summaries: list[imp.ImportSummary] = []
+    skipped: list[str] = []
+    warnings = list(fetched.warnings)
+    warnings.extend(fetched.errors)
+    if fetched.skipped_pending:
+        warnings.append(f"{fetched.skipped_pending} pending transaction(s) were skipped")
+    marks_out: dict[str, int] = {}
+
+    for remote in fetched.accounts:
+        foreign = bool(remote.currency and remote.currency.upper() != currency)
+        local = _local_account(store, remote, provider, today,
+                               update_balance=not foreign)
+        if remote.balance is None and local.balance_as_of is None and not local.balance:
+            warnings.append(
+                f"{remote.name}: the feed did not report a balance; it was recorded as "
+                "unknown")
+
+        if foreign:
+            # §22: flagged, never summed. The account and its balance are recorded so it
+            # is visible, and not one transaction from it is imported. Its balance is not
+            # written into the local currency either.
+            skipped.append(f"{remote.name} ({remote.currency})")
+            warnings.append(
+                f"{remote.name} is in {remote.currency} and the app works in {currency}; "
+                "its transactions were not imported")
+            continue
+
+        if not local.currency:
+            local.currency = currency
+            store.version += 1
+
+        usable: list[imp.RawTxn] = []
+        undated = 0
+        for txn in remote.transactions:
+            if txn.posted is None:
+                undated += 1
+                continue
+            description = (imp.clean_description(txn.description)
+                           or txn.merchant or "Unknown transaction")
+            usable.append(imp.RawTxn(
+                date=txn.posted, amount=txn.amount, description=description,
+                external_id=txn.id or None,
+                merchant=txn.merchant or imp.guess_merchant(description),
+                raw={"provider_category": txn.category},
+                status="pending" if txn.pending else "posted",
+                identity_description=txn.description,
+            ))
+        if undated:
+            # Counted and said out loud. A transaction the feed sent with a date this
+            # app cannot read must not disappear into "no new transactions".
+            warnings.append(
+                f"{undated} transaction(s) from {remote.name} had no readable date and "
+                "were not imported")
+
+        summary = imp.import_rows(
+            store, usable, source=f"{provider}:{remote.id}", account=local.id,
+            rules=rules, now=imported_at,
+            # Same identity as a statement import, so the same transaction arriving from
+            # both a feed and a file is recognised as one row.
+            identity_source="import",
+        )
+        summaries.append(summary)
+
+        if remote.id in fetched.failed_ids:
+            high_water = local.high_water or 0
+        elif remote.latest_epoch:
+            high_water = max(remote.latest_epoch, local.high_water or 0)
+        else:
+            # The feed was read through today and had nothing to import. Record that, so
+            # an empty account does not re-request the whole lookback window forever.
+            high_water = max(_date_epoch(today), local.high_water or 0)
+        if high_water != (local.high_water or 0):
+            local.high_water = high_water
+            # The watermark is part of what a caller persists; a run that imported no
+            # rows but moved it must still look like a change.
+            store.version += 1
+        marks_out[remote.id] = high_water
+
+    if not fetched.accounts:
+        warnings.append("the feed returned no accounts")
+
+    summary = imp.rolled_up_import_summaries(summaries)
+    if fetched.errors and len(fetched.errors) >= max(1, len(fetched.accounts)):
+        # Every account failed. That is a failed sync, not an empty one. A single failed
+        # account beside healthy ones is a partial success: ok stays true, and
+        # ``describe`` names the failure.
+        return SyncResult(
+            ok=False,
+            summary=summary,
+            error=SyncError("; ".join(fetched.errors), kind="error"),
+            accounts=len(fetched.accounts),
+            skipped_accounts=skipped,
+            warnings=warnings,
+            marks=marks_out,
+            provider=provider,
+            failed_accounts=len(fetched.errors),
+        )
+
+    return SyncResult(
+        ok=True,
+        summary=summary,
+        accounts=len(fetched.accounts),
+        skipped_accounts=skipped,
+        warnings=warnings,
+        marks=marks_out,
+        provider=provider,
+        failed_accounts=len(fetched.errors),
+    )
 
 
 def sync(
@@ -440,7 +706,7 @@ def sync(
     include_pending: bool = False,
     since: date | None = None,
 ) -> SyncResult:
-    """Pull the delta for every account and run it through the import pipeline.
+    """Pull the SimpleFIN delta for every account and import it.
 
     Incremental by a per-account high-water mark, pulled back by a few days so a
     late-posted transaction is not missed; the overlap is re-fetched and deduped, which
@@ -458,74 +724,21 @@ def sync(
             "no bank connection is configured — reconnect required",
             status=401, kind="unauthorised"))
 
-    currency = store.settings.currency
-    start = since
+    start = since or _start_for(store, "simplefin", today=today,
+                                lookback_days=lookback_days)
     try:
-        if start is None:
-            marks = [
-                _since_for(store, a.external_id, today=today, lookback_days=lookback_days)
-                for a in store.view().accounts if a.external_id
-            ]
-            start = min(marks) if marks else today - timedelta(days=lookback_days)
         fetched = fetch_accounts(access_url, since=start, transport=transport,
                                  include_pending=include_pending)
     except SyncError as exc:
-        return SyncResult(ok=False, error=exc)
+        return SyncResult(ok=False, provider="simplefin", error=exc)
+    return apply_fetch(store, fetched, provider="simplefin", today=today,
+                       imported_at=imported_at, rules=rules)
 
-    summaries: list[imp.ImportSummary] = []
-    skipped: list[str] = []
-    warnings = list(fetched.warnings)
-    marks_out: dict[str, int] = {}
 
-    for remote in fetched.accounts:
-        local = _local_account(store, remote)
-
-        if remote.currency and remote.currency != currency:
-            # §22: flagged, never summed. The account and its balance are recorded so it
-            # is visible, and not one transaction from it is imported.
-            skipped.append(f"{remote.name} ({remote.currency})")
-            warnings.append(
-                f"{remote.name} is in {remote.currency} and the app works in {currency}; "
-                "its transactions were not imported")
-            continue
-
-        if not local.currency:
-            local.currency = currency
-
-        usable = [t for t in remote.transactions if t.posted is not None]
-        undated = len(remote.transactions) - len(usable)
-        if undated:
-            # Counted and said out loud. A transaction the bridge sent with a date this
-            # app cannot read must not disappear into "no new transactions".
-            warnings.append(
-                f"{undated} transaction(s) from {remote.name} had no readable date and "
-                "were not imported")
-        rows = [
-            imp.RawTxn(date=t.posted, amount=t.amount, description=t.description,
-                       external_id=t.id or None)
-            for t in usable
-        ]
-        summary = imp.import_rows(
-            store, rows, source=f"simplefin:{remote.id}", account=local.id,
-            rules=rules, now=imported_at,
-        )
-        summaries.append(summary)
-
-        high_water = remote.latest_epoch or (local.high_water or 0)
-        local.high_water = high_water
-        marks_out[remote.id] = high_water
-
-    if not fetched.accounts:
-        warnings.append("the bridge returned no accounts")
-
-    return SyncResult(
-        ok=True,
-        summary=imp.rolled_up_import_summaries(summaries),
-        accounts=len(fetched.accounts),
-        skipped_accounts=skipped,
-        warnings=warnings,
-        marks=marks_out,
-    )
+def _no_credential(name: str) -> SyncResult:
+    return SyncResult(ok=False, error=SyncError(
+        f"no {name} credential is configured — reconnect required",
+        status=401, kind="unauthorised"))
 
 
 def run_sync(
@@ -536,22 +749,58 @@ def run_sync(
     imported_at: datetime | None = None,
     transport: Transport | None = None,
     rules: list[Rule] | None = None,
+    provider: str | None = None,
 ) -> SyncResult:
-    """What the UI calls: read the credential, check the switch, sync."""
+    """What the UI calls: pick a provider, read its credential, sync."""
     if not store.settings.enable_bank_sync:
         return SyncResult(ok=False, error=SyncError(
             "bank sync is turned off in Settings", kind="disabled"))
-    access_url = secrets.simplefin_access_url
-    if not access_url:
+    if provider is not None and provider.strip().lower() not in FEED_PROVIDERS:
+        return SyncResult(ok=False, error=SyncError(
+            f"unknown feed provider {provider!r}", kind="disabled"))
+    selected = provider_for(store.view(), secrets, provider)
+    if not selected:
         return SyncResult(ok=False, error=SyncError(
             "no bank connection is configured — reconnect required",
             status=401, kind="unauthorised"))
-    return sync(store, access_url=access_url, today=today, imported_at=imported_at,
-                transport=transport, rules=rules)
+    if selected == "simplefin":
+        access_url = secrets.simplefin_access_url
+        if not access_url:
+            return _no_credential("SimpleFIN")
+        return sync(store, access_url=access_url, today=today, imported_at=imported_at,
+                    transport=transport, rules=rules,
+                    include_pending=store.settings.feed_include_pending)
+
+    from finance_tool.engine import feeds
+
+    start = _start_for(store, selected, today=today, lookback_days=DEFAULT_LOOKBACK_DAYS)
+    include_pending = store.settings.feed_include_pending
+    try:
+        if selected == "redbark":
+            key = secrets.feed_redbark
+            if not key:
+                return _no_credential("Redbark")
+            fetched = feeds.fetch_redbark(
+                key, since=start, today=today, include_pending=include_pending,
+                transport=transport)
+        elif selected == "banksync":
+            key = secrets.feed_banksync
+            if not key:
+                return _no_credential("BankSync")
+            fetched = feeds.fetch_banksync(
+                key, bank_id=store.settings.feed_banksync_bank_id, since=start,
+                today=today, include_pending=include_pending, transport=transport)
+        else:
+            return SyncResult(ok=False, error=SyncError(
+                f"unknown feed provider {selected!r}", kind="disabled"))
+    except SyncError as exc:
+        return SyncResult(ok=False, error=exc, provider=selected)
+    return apply_fetch(store, fetched, provider=selected, today=today,
+                       imported_at=imported_at, rules=rules)
 
 
-def high_water_date(store, remote_id: str) -> date | None:
-    account = store.view().account_by_external(remote_id)
+def high_water_date(store, remote_id: str, provider: str | None = None) -> date | None:
+    account = store.view().account_by_external(remote_id, provider=provider)
     return epoch_to_date(account.high_water) if account and account.high_water else None
 
 

@@ -1,23 +1,24 @@
 # Backend reference
 
-The Qt-free half of the app: `store/`, `engine/` and `hooks/`.
+The Qt-free half of the app: `store/`, `engine/`, `hooks/`, and the packages built over
+them for statement ingestion, live feeds, categorisation, the LLM assistant, MCP, the
+read-only SQL console, the local HTTP API and the AI Finance Manager migration.
 
-**Status, 2026-10-08: the frontend has been removed to be redesigned.** What remains is the
-backend, its tests (867 passing, in about eleven seconds, with no Qt installed at all), and
-the two documents. References below to `ui/`, to `--shot` and to the widget catalogue
-describe the *reference frontend that was deleted* — kept because they record decisions
-worth reusing, not because that code is still here. Everything the backend promises is still
-promised; only the thing that used to read it is gone.
+**Status, 2026-11-24: the frontend is still absent, by design.** Every user-facing feature
+of the former AI Finance Manager now has a backend implementation (§10); none of it has a
+screen yet. References below to `ui/`, to `--shot` and to the widget catalogue describe the
+*reference frontend that was deleted* — kept because they record decisions worth reusing,
+not because that code is still here.
 
-Written 2026-10-07, against schema v1. This document is the contract a new frontend reads.
+Written 2026-10-07 against schema v1; §10 records the v2 extension. This document is the
+contract a new frontend reads.
 
-Read alongside `design-doc.md`, which is the specification. This document describes what
-was *built*: the same decisions, plus the parts the spec left open, plus the traps that
-cost time.
+Read alongside `design-doc.md`, which is the specification, and `FRONTEND.md`, which is the
+interaction spec. This document describes what was *built*: the same decisions, plus the
+parts the spec left open, plus the traps that cost time.
 
-**Sizes.** `store` 1.9k lines / 8 files · `engine` 5.8k / 14 · `hooks` 1.3k / 5 ·
-`tests` 10k / 22. **867 tests passing**, 1 skipped (a POSIX file-mode check that cannot run
-on Windows). No `ui/`.
+**Sizes.** 15.2k lines of backend / 51 files; 12.3k lines of tests. **1,146 tests passing**,
+1 skipped (a POSIX file-mode check that cannot run on Windows). No `ui/`.
 
 ---
 
@@ -48,6 +49,9 @@ Corollaries a frontend must respect:
   deliberately mutating an entity in place, see §4.6).
 - No engine function takes a widget, a `QObject`, or a signal.
 - No engine function reads the clock. `today` is always a parameter.
+- The packages above `engine` — `llm`, `assistant`, `query`, `httpapi`, `mcp_server` — are
+  Qt-free too. They are things the backend *offers*, never things the frontend imports a
+  screen from.
 
 ---
 
@@ -55,7 +59,8 @@ Corollaries a frontend must respect:
 
 ```
 finance_tool/
-  paths.py            where data lives: data/store.db, secrets.json, backups/
+  paths.py            where data lives: store.db, secrets.json, backups/, statements/,
+                      exports/, profile.md
   demo.py             a small in-memory dataset for --demo and --shot. Never written to disk.
   store/              +--------------------------------------------------+
     entities.py       |  no Qt in this block, enforced by a test          |
@@ -63,28 +68,40 @@ finance_tool/
     db.py             |   store  ──▶  engine  ──▶  hooks  ──▶  ui        |
     history.py        |   entities   pure         WidgetData   Qt only   |
     migrations.py     |                                                  |
-    secrets.py        |                                                  |
-    store.py          |                                                  |
+    secrets.py        |  llm/ assistant/ query/ httpapi/ mcp_server/      |
+    store.py          |  sit above engine and below the frontend          |
   engine/             +--------------------------------------------------+
     rrule.py       recurrence.py  periods.py   ledger.py   analytics.py
     goals.py       shared.py      tracker.py   detect.py
     categorise.py  search.py      importers.py sync.py
+    statements.py  intake.py      feeds.py     categories.py
+    review.py      classify.py    transfers.py exports.py
   hooks/
     types.py       HookContext, WidgetData, Row
     templates.py   ratio, share_of, delta, cumulative, rolling_mean, scale, combine
     cache.py       memoisation keyed on store.version
     library.py     the 35 hooks the widget catalogue calls
-  ui/               the only package that imports PyQt6
+  llm/              provider-neutral chat + classification; lazy SDK imports
+  assistant/        chat loop, 15 tools, finance context
+  query.py          read-only SQL over the store
+  httpapi.py        local CDR-shaped read-only HTTP API, PIN-gated
+  mcp_server.py     stdio MCP server exposing the same tools as resources
+  migrate_afm.py    one-way import of an AI Finance Manager database
+  ui/               the only package that imports PyQt6 (currently absent)
 ```
 
 Dependency direction is one-way and does not cycle:
 
 ```
 paths ← store ← engine ← hooks ← ui
+                 ▲
+      llm, assistant, query, httpapi, mcp_server
 ```
 
-`importers` and `sync` are the **only** two engine modules allowed to touch the filesystem
-or a socket. Every other engine module is pure.
+`importers`, `intake`, `sync`, `feeds` and `exports` are the engine modules allowed to touch
+the filesystem or a socket; `statements` is pure (bytes and text in). Network access outside
+the engine lives in `llm/` (the vendor SDKs), `httpapi` (a loopback server) and
+`mcp_server` (stdio). `query` opens the store read-only. Every other engine module is pure.
 
 ---
 
@@ -173,23 +190,53 @@ Notes:
 - `expanded` is UI-only state that lives in the domain because there is nowhere else for
   a per-row flag to persist.
 
-**`Account`** — `id, name, kind, balance, currency, external_id, high_water`.
-`high_water` is the SimpleFIN incremental mark (the last `posted` epoch seen), added for
-§22 and not in the spec's table.
+**`Account`** — `id, name, kind, balance, currency, external_id, high_water`,
+plus `provider`, `masked`, `balance_as_of`.
+`high_water` is the per-account incremental mark the feed modules advance (the last
+`posted` epoch seen). `provider` scopes `external_id`, because two feeds may use the same
+id for different accounts. `masked` is the printed number (`****1234`) used to place a
+statement that does not name its account, and `balance_as_of` stops an older statement
+overwriting a newer balance just because it was imported later.
 
 **`Transaction`** — `id, date, amount, description, account, category, tags, external_id,
-fingerprint, source, imported_at, rule_id`.
-`fingerprint` is the fallback identity for rows with no `external_id` (§7.2), and
-`rule_id` records which rule claimed the row so a hand-edit can release it.
+fingerprint, source, imported_at, rule_id`, plus `merchant, note, category_source,
+category_confidence, needs_review, import_id, status, value_date, currency`.
+`fingerprint` is the fallback identity for rows with no `external_id` (§7.2); `rule_id`
+records which rule claimed the row so a hand-edit can release it. `merchant` is what the
+statement named (rules match on it); `category_source` is `rule|memory|llm|bank|user|detected`
+and `category_confidence` is the source's own estimate; `needs_review` mirrors an open
+review item; `import_id` points at the statement that produced the row; `status` is
+`posted|pending`; `currency` is the line's own currency when it is not the account's.
+
+**`Rule`** — `id, match, category, tags, priority`, plus `name`, `match_type`
+(`contains|equals|regex|merchant`), `amount_min`, `amount_max`, `active`, `hit_count`.
+`match` remains the pattern. Amount bounds are compared against the transaction's
+**magnitude**, not its signed value.
 
 **`Snapshot`** — `date, value`. A net-worth reading. Whether these are captured
 automatically is an open decision in the spec; the engine reports what exists.
 
-**`Settings`** — preferences: `currency, lens, anchor, canvases, canvas_active,
-enable_bank_sync, animate`. `lens` is one of `week|month|quarter|year`.
+**`ReviewItem`** — `id, transaction_id, question, reason, options, suggested_category,
+status (open|resolved|skipped), answer, resolved_category, created_at, resolved_at`.
+Persisted rather than derived: "this one could not be decided" is a promise that must
+survive a restart.
 
-**`StoreDocument`** — `schema_version` plus eight lists: `items, accounts, transactions,
-rules, goals, tracker, people, snapshots`.
+**`ImportRecord`** — one statement file that was read, successful or not:
+`id, filename, file_hash, source_type, account, rows_total, rows_new, rows_duplicate,
+rows_skipped, status, error, imported_at, span_start, span_end`.
+
+**`ChatMessage`** — one assistant turn: `id, role (user|assistant|tool), content` (raw
+markdown), `tool_calls`, `raw` (the provider's own content blocks, replayed verbatim when
+needed) and `thinking` (the model's reasoning, stored apart from the answer).
+
+**`Settings`** — preferences: `currency, lens, anchor, canvases, canvas_active,
+enable_bank_sync, animate`, plus `ai_provider, ai_model, ai_effort, ai_base_url, ai_writes,
+review_threshold, feed_provider, feed_include_pending, feed_banksync_bank_id,
+inbox_poll_minutes, feed_poll_minutes, onboarded`. `ai_writes` gates every assistant tool
+that mutates the store; credentials never live here (see §4.8).
+
+**`StoreDocument`** — `schema_version` plus eleven lists: `items, accounts, transactions,
+rules, goals, tracker, people, snapshots, reviews, imports, messages`.
 
 **`PlacedWidget` / `Canvas`** — layout data: `widget, x, y, w, h, config` on a 12-column
 grid. Layout is *data*, and the engine never reads it. A frontend may replace this
@@ -210,9 +257,16 @@ at display** — `theme.format_money`, in the UI layer.
 ```
 data/                     gitignored, created on first run
   store.db                the whole domain, in SQLite
-  secrets.json            sync credential only — never logged, never exported
-  backups/                timestamped snapshots, written before any migration
+  secrets.json            DPAPI-encrypted credentials — never logged, never exported
+  backups/                snapshots, written before any migration or forced replacement
+  statements/inbox/       statement files waiting to be read
+  statements/processed/   statement files already read
+  exports/FY<year>/       generated markdown summaries
+  profile.md              the assistant's notes about the user
 ```
+
+`paths.py` owns these names; nothing else hard-codes a path. `exports/` and `profile.md`
+are disposable — the database is the source of truth.
 
 One database rather than a file per entity, because the app's queries span entities: a
 budget-vs-actual view reads items *and* transactions, and one database makes that read
@@ -231,9 +285,20 @@ of strings and therefore a column rather than a structure. A `list` or `dict` be
 **JSON column**: `overrides`, `cancelled`, `paid`, `tags`, `shared` are per-occurrence bags
 keyed by a date, and a table each would mean several joins for a query nobody writes.
 
-**`user_version` is stamped once**, when the database is created, and never overwritten —
-writing it on every open would silently relabel a store made by a newer build as this
-build's.
+**`user_version` is the schema marker, not a write timestamp.** A new database is stamped
+with `dbm.SCHEMA_VERSION` (2) when it is created. An older database is upgraded on its next
+*writable* open: `ensure_schema` creates missing tables, `upgrade_schema` adds missing
+columns inside one transaction using each field's dataclass default, and only then bumps
+`user_version`. A database written by a newer build is never relabelled, and a read-only
+open performs no migration at all. Migration is not incidental: `write_one` would fail on a
+row whose entity has gained a column, so an existing store that cannot be upgraded is
+refused rather than half-written.
+
+**A failed migration is not corruption.** The store is probed before migrating, so an
+`ALTER TABLE` that fails leaves a database that is still readable and is reported as
+"could not be upgraded" — it is never moved aside as a corrupt file, and the bytes on disk
+are unchanged. A successful migration captures a `pre-migration` revision first (§4.7).
+`store.notes` records that the store was upgraded.
 
 **Occurrences are still derived, never stored.** That is the most important property of
 this data model and the schema does not change it.
@@ -361,9 +426,22 @@ diff or hand to someone. It is what `atomic_write_json` is still for.
 
 ### 4.8 Secrets
 
-`data/secrets.json`, mode `0600` best-effort, holds `simplefin_access_url` and nothing
-else. `Secrets.__repr__` prints key *names*, never values, so a credential cannot reach a
-log through an f-string. `save_secrets` with nothing in it **deletes the file** — revoking
+`data/secrets.json`, mode `0600` best-effort, holds eight keys:
+
+```
+simplefin_access_url   llm_anthropic   llm_openai   llm_deepseek
+llm_openrouter         feed_redbark    feed_banksync   app_pin_hash
+```
+
+**Values are encrypted with Windows DPAPI** (`CryptProtectData`/`CryptUnprotectData` through
+`ctypes`), tied to the Windows account, and stored with a `dpapi:` prefix. A plain value is
+read as legacy plaintext and re-encrypted on the next save; a `plain:` prefix exists only so
+tests and a non-Windows checkout can round-trip. Copying `store.db` and `secrets.json` to
+another machine leaves the values undecryptable, and the app reports that key as
+unconfigured instead of failing.
+
+`Secrets.__repr__` prints key *names*, never values, so a credential cannot reach a log
+through an f-string. `save_secrets` with nothing in it **deletes the file** — revoking
 leaves no residue. There is no field for a bank password, and a test asserts that.
 
 ### 4.9 `Store` (writing) and `StoreView` (reading)
@@ -378,7 +456,7 @@ view.items / accounts / transactions / rules / goals / tracker / people / snapsh
 view.item(id) / account(id) / person(id) / rule(id) / goal(id) / transaction(id)
 view.item_name(id) / person_name(id)
 view.children_of(parent_id) / roots()
-view.account_by_external(external_id)
+view.account_by_external(external_id, provider=None)   # scoped to its feed when given
 view.foreign_accounts()          # currency ≠ the app's: flagged, never summed (§8)
 view.settings / view.version / view.currency
 ```
@@ -417,7 +495,7 @@ Four contracts hold everywhere (`design-doc.md` §15), and they are the reason t
 can be trusted:
 
 1. **Pure.** A function of its arguments and the store snapshot. No clocks, no globals, no
-   I/O — except in `importers` and `sync`.
+   I/O — except in `importers`, `intake`, `sync`, `feeds` and `exports` (§2).
 2. **Read-only over the store.** A query never mutates. (The `Store` mutators above are
    the explicit exception, and they are not engine functions.)
 3. **No Qt.** See §1.
@@ -782,6 +860,8 @@ parse_file(path, *, source=None) -> ParseResult      # dispatches on content, no
 parse_bytes(data, *, source="upload") -> ParseResult # what a sync response gives you
 parse_csv(text, *, source="csv", delimiter=None, column_map=None) -> ParseResult
 parse_ofx(text, *, source="ofx") -> ParseResult
+parse_camt053(text, *, source="camt053") -> ParseResult
+parse_pdf(data, *, source="pdf") -> ParseResult          # pdfplumber, lazy import
 detect_columns(rows, headers=()) -> ColumnChoice
 find_header_row(rows) / find_first_data_row(rows, start) -> int | None
 parse_date(text, *, day_first=True) -> date | None
@@ -808,7 +888,11 @@ apply_reconciliation(store, result) -> int                 # acts, and bumps ver
 ```
 
 Normalisation produces **one shape** — `RawTxn(date, amount (signed, negative = out),
-description, external_id, raw)` — so nothing downstream cares where a row came from.
+description, external_id, raw)`, plus the optional `merchant`, `value_date`, `status` and
+`category` a statement or feed may know — so nothing downstream cares where a row came
+from. Dispatch sniffs the content: `%PDF-` magic, then CAMT's `<Document`/`camt.053`
+markers, then OFX, then CSV, using the suffix only as a hint. PDF support needs the
+`ingest` extra (§10.12) and reports its absence rather than failing obscurely.
 
 **Column detection, not a fixed schema.** Headers win where they exist; where they do not,
 each column is scored against date and amount predicates over a sample, already-chosen
@@ -1050,11 +1134,38 @@ If a change breaks one of these, the change is wrong.
     `tests/test_ui_hardening.py`)
 17. A restore can itself be undone: `restore()` snapshots the present before it replaces
     it, and retention never prunes a deliberate snapshot. (`tests/test_history.py`)
+18. `monthly_equiv` is a property of the rule, not of the range being asked about, so the
+    rollup and the scheduler cannot disagree about the same plan.
 19. A store another process holds is **busy, not corrupt**: it is never moved aside, and
     no substitute store is opened in its place. A second window's stale save is refused
     rather than silently overwriting the first. (`tests/test_review_fixes.py`)
-18. `monthly_equiv` is a property of the rule, not of the range being asked about, so the
-    rollup and the scheduler cannot disagree about the same plan.
+20. **Importing never calls the LLM.** Classification is an explicit command run afterwards,
+    when a provider is configured. A statement file arriving from a folder cannot spend
+    money or take minutes without someone asking.
+21. **A failed fetch is not an empty one.** A sync, feed request or LLM call that failed
+    carries its reason; it is never flattened into "no new transactions" or "nothing to
+    categorise". (`tests/test_sync.py`, `tests/test_feeds.py`, `tests/test_classify.py`)
+22. **Transfers are not spending.** Rows in a transfer-kind category are excluded from
+    income, expense, savings-rate and budget totals, and transfer detection never replaces a
+    category a person or a rule chose.
+23. **Credentials live only in `secrets.json`, encrypted.** They are never in `Settings`,
+    never in an export, never in a log or a traceback; a copied store reports the key as
+    unconfigured rather than leaking it.
+24. **Read-only SQL is read-only in SQLite, not just in a validator.** One SELECT/WITH on a
+    `mode=ro` connection, with an authorizer that refuses a write even if the text check
+    were bypassed, and a LIMIT that is always applied (clamped to 5,000).
+25. **The assistant writes only through the store, only when allowed.** `Settings.ai_writes`
+    gates every mutating tool, a `before-ai` revision is captured before the first write,
+    and the caller saves once.
+26. **The chat transcript stores what the model said, not a rendering of it.** `content` is
+    raw markdown; `thinking` and the provider's raw blocks are kept separately so the UI can
+    render formatting and expose reasoning without altering the answer.
+27. **The AFM migration is read-only on its source and verifies before it claims success.**
+    It refuses a destination that already has data unless forced, backs up before replacing,
+    and checks row counts and the net total before reporting.
+28. **A review decision is a category or an explicit skip.** Resolving without a category
+    clears the provisional guess and `needs_review` together; no row is left looking decided
+    when it is not.
 
 ---
 
@@ -1066,10 +1177,21 @@ group, hook id, bands, default size, floor, summary), write a `@hook("id")` func
 asserts every spec has both a hook and a renderer, and that every spec's default size is at
 or above its floor.
 
-**Add a parser.** Write `parse_x(text, *, source) -> ParseResult` producing `RawTxn`s, then
-add the suffix to the dispatch in `parse_file`. CAMT.053 is the known candidate — the spec
-marks it not required and the dispatch is the single entry point it would plug into.
-Nothing downstream needs changing: normalisation is one shape.
+**Add a statement format.** Write `parse_x(text, *, source) -> ParseResult` producing
+`RawTxn`s, then add its sniffing branch to `parse_file`/`parse_bytes`. Nothing downstream
+needs changing: normalisation is one shape. A format that needs a third-party library
+imports it lazily and reports the missing extra as a parse warning.
+
+**Add a feed.** Implement `fetch_x(api_key, *, since, today, ...) -> FetchResult` over the
+`Transport` protocol, map its rows onto `RawTxn` (`merchant`, `category`, `status`,
+`value_date` where the provider knows them), and add the provider to `provider_for` and
+the factory that reads `Settings.feed_provider`. Keep the high-water bump inside
+`apply_fetch`, so a failed fetch cannot advance it.
+
+**Add an assistant tool.** Add a `ToolSpec` to `assistant/tools.py` and a branch in
+`execute_tool`. A read tool needs nothing else; a write tool must check
+`Settings.ai_writes`, go through a `Store` mutator, and be covered by the `before-ai`
+revision the chat loop already takes.
 
 **Add a recurrence part.** Handle it in `engine/rrule.py` — as a field on `RRule`, a branch
 in `_expand()`/`_passes_day_filters()`, a branch in `rate_per_month()`, and a phrase in
@@ -1078,9 +1200,11 @@ anything else is already reachable through the editor's custom field, which is t
 having adopted a standard syntax rather than a menu. A part that is understood but unusable
 goes in `IGNORABLE`, which surfaces it to the editor instead of dropping it silently.
 
-**Change the schema.** Bump `SCHEMA_VERSION`, add `vN_to_vN1(doc) -> dict` to `MIGRATIONS`
-in `store/migrations.py`. Give every new field a default so an older document still loads.
-The backup-before-migrate step is automatic.
+**Change the schema.** Add the field to the entity **with a default**, and bump
+`SCHEMA_VERSION` in `store/db.py` when it becomes a column. On the next writable open,
+`upgrade_schema` adds the missing columns transactionally after a `pre-migration` backup, so
+old rows take the default and stay readable. For the JSON export shape, add
+`vN_to_vN1(doc) -> dict` to `MIGRATIONS` in `store/migrations.py`.
 
 **Replace the frontend.** Delete `ui/`, keep everything else. You will need: `paths`,
 `store` (load/save/mutate), `engine` (all numbers), `hooks` (the widget data contract), and
@@ -1108,6 +1232,13 @@ Recorded because these are judgement calls, not transcription.
 | Does re-running categorisation overwrite a hand-set category? | No | A hand-edit outranks a rule. `protect_manual=False` is there for the rare caller who wants the rules to win. |
 | Does an unlinked goal share the surplus minus the linked commitments? | No — the whole surplus | The linked savings transfer is already an expense in the surplus. Subtracting it again lost it. |
 | Asking whether a transaction paid an occurrence, vs marking it | Two functions: `reconcile` (view) and `apply_reconciliation` (store) | Marking through a read-only facade both breaks §15.2 and skips the version bump the hook cache depends on. |
+| Does importing run the LLM categoriser? | No — never | A dropped file must not spend money or block on a network call. Classification is an explicit follow-up command; unclassified rows stay visible as uncategorised. |
+| What is a transfer? | Equal-and-opposite rows in **different** accounts within 3 days, at least $1, matched one-to-one | A maximum matching rather than first-come pairing, so one large row cannot consume the partner a smaller pair needed. User- and rule-set categories are never overwritten. |
+| Are provider category hints trusted? | Only on an exact taxonomy match, and never on transfers or `Uncategorised` | A feed's category is a guess from someone else's vocabulary; it must not become a transfer that vanishes from spend, or an "uncategorised" label that hides a row from review. |
+| Where does the assistant's authority stop? | `Settings.ai_writes`, default on, and a `before-ai` revision | The model can be wrong; the revision makes a bad tool call an undo rather than a loss. With writes off every mutating tool refuses and the model is told so. |
+| How is the PIN stored? | A SHA-256 hash in `secrets.json`, never the PIN | The HTTP API compares a hash; nothing recoverable is written down. |
+| Does the HTTP API write? | No | It exists to expose the read-only CDR shape to another local tool. Every route opens the store with `create=False` and a request that would need a write is a 404/503, not an action. |
+| How does the AFM migration handle a foreign or partial database? | Refuse before writing | A migration that half-imports is worse than one that does not start. Missing required tables, unreadable rows, or a destination holding any data all stop it, and `--dry-run` lists the same refusals. |
 
 ### Known gaps
 
@@ -1117,7 +1248,244 @@ Recorded because these are judgement calls, not transcription.
   lines removed, so they can be a few lines off in a file that has them. Reporting-only.
 - **Net-worth snapshots** are read but never captured automatically — the spec leaves the
   schedule undecided (§38). `net_worth_series` reports whatever readings exist.
-- **CAMT.053** is not parsed; see §8.
-- **IBM Plex Sans is not bundled.** `ui/app.py` looks in `assets/fonts/` for TTF/OTF and
-  otherwise resolves the first available system family from a candidate list. Qt cannot
-  load the design system's woff2. Bundling the OFL-licensed TTF is the open step.
+- **None of §10's features has a frontend surface yet.** Chat, import/inbox, feed and
+  provider settings, the review dialog, the SQL console and the PIN screen are backend-only.
+  `FRONTEND.md` §11 lists them so the redesign picks them up.
+- **IBM Plex Sans is not bundled.** `ui/app.py` looked in `assets/fonts/` for TTF/OTF and
+  otherwise resolved the first available system family from a candidate list. Qt cannot
+  load the design system's woff2. Bundling the OFL-licensed TTF is still the open step.
+
+---
+
+## 10. The AI Finance Manager features (schema v2)
+
+Every user-facing capability of the former AI Finance Manager now has a backend here. The
+port kept GridFinance's shape: the engine computes, `None` is absence, hooks stay pure, and
+nothing imports Qt. What is new is a set of store-writing *services* (import, review,
+classification, transfers) and, above the engine, the packages a future frontend or a local
+tool can call: `llm`, `assistant`, `query`, `httpapi`, `mcp_server`.
+
+### 10.1 Statements — `engine/statements.py`
+
+Pure parsers, text or bytes in, `ParseResult` out. No file access.
+
+```python
+parse_camt053(text, *, source="camt053") -> ParseResult
+parse_pdf(data, *, source="pdf") -> ParseResult
+```
+
+CAMT.053 is namespace-agnostic and accepts base64-wrapped documents. Balances come from
+`OPBD`/`CLBD`, identity from `AcctSvcrRef` (with a fallback when the file repeats one), and
+the entry's own currency is kept. PDF parsing tries `pdfplumber` tables first and falls back
+to text, using the header row to locate amount and balance columns rather than assuming
+positions; wrapped description lines are joined. Both report what they guessed in the
+result's warnings, and `ParseResult.meta` carries the account name, masked number, closing
+balance and date, and statement period.
+
+`clean_description` and `guess_merchant` are shared: the merchant is what rules match on,
+so it is extracted once at parse time and stored on the row.
+
+### 10.2 Intake — `engine/intake.py`
+
+```python
+resolve_account(store, parsed, wanted=None) -> Account | str   # str is the reason
+import_path(store, path, *, account=None, move_processed=False, processed_dir=None,
+            now=None) -> ImportOutcome
+scan_inbox(store, *, folder=None, processed_dir=None, account=None, now=None,
+           save=True) -> list[ImportOutcome]
+```
+
+One statement file is one `ImportRecord`, **including a failed import** — a history that
+omits failures is a history that cannot explain a missing month. Account resolution is
+explicit id → masked number → unambiguous name → the sole account → refusal; a currency
+mismatch is a refusal, not an import into the wrong ledger. File-hash idempotency is scoped
+per account, so the same statement filed twice contributes nothing.
+
+`scan_inbox` reads every file in `data/statements/inbox/`, moves each one to `processed/`
+only after the store has been saved, and saves **once** for the whole scan. A file that
+cannot be read stays in the inbox and is recorded as an error, not deleted.
+
+### 10.3 Live feeds — `engine/feeds.py`, `engine/sync.py`
+
+```python
+fetch_redbark(api_key, *, since, today, include_pending=False, transport=None) -> FetchResult
+fetch_banksync(api_key, *, bank_id, since, today, include_pending=False, transport=None) -> FetchResult
+run_sync(store, secrets, *, today, imported_at=None, transport=None, rules=None) -> SyncResult
+```
+
+Both feeds speak through the existing `Transport` protocol, so tests stub the wire and
+nothing above it is protocol logic. Pagination is followed to the end and a truncated page
+is an error, not a short ledger. Pending rows are skipped unless
+`Settings.feed_include_pending`; a provider category is applied only on an exact taxonomy
+match, never to a transfer or to "uncategorised".
+
+`run_sync` picks the provider from an explicit argument, then `Settings.feed_provider`,
+then whichever credential exists (SimpleFIN first, for continuity with stores configured
+before the other feeds arrived), and keeps a per-account high-water mark with the five-day
+overlap. An account that failed is named with its reason; `SyncResult.ok` is true
+only if every requested account succeeded. A feed account is adopted as an existing local
+account only when exactly one account matches its masked number or name **and** currency.
+
+### 10.4 Categories, review, classification, transfers
+
+`engine/categories.py` is the taxonomy: leaf names, a `kind` (`expense|income|transfer`),
+parent lookup and the two reserved names `Transfers` and `Uncategorised`. Transfer-kind
+rows are excluded from spend and income by `analytics` and `ledger`.
+
+`engine/review.py` is the persistent queue:
+
+```python
+queue(store, txn, *, question=None, reason="low_confidence", options=None,
+      suggested_category="", suggested_confidence=None, now=None)
+open_items(view) / open_count(view) / find_open(view, transaction_id)
+resolve(store, review_id, category, *, make_rule=False) / skip(store, review_id)
+resolve_transaction(store, transaction_id, category, *, source="user")
+```
+
+Queueing is idempotent on the transaction. Resolving with a null or blank category is an
+explicit "no category": it clears the provisional guess and `needs_review` rather than
+leaving a row that looks decided. Making a rule from a review uses the merchant as a
+`match_type="merchant"` rule, and offers retro-application.
+
+`engine/classify.py` is the staged classifier: rules, then merchant memory, then the LLM in
+chunks of 40. It applies a category at or above `Settings.review_threshold` with its source
+and confidence; below it, the guess is stored as a suggestion and queued. A missing key
+queues with `no_ai`, a provider failure with `ai_error`, and both surface their reason.
+**Import never calls this.** Transfer and Uncategorised are not offered as answers.
+
+`engine/transfers.py` detects equal-and-opposite rows in different accounts within three
+days (at least $1) using a maximum bipartite matching, then files the pairs as `Transfers`
+without touching a category a person or a rule set. The matching matters: greedy pairing can
+consume the partner a later, smaller pair needed.
+
+### 10.5 Exports — `engine/exports.py`
+
+```python
+financial_year(when) -> str / fy_bounds(fy) -> (date, date)
+summary_markdown(view, fy) -> str
+export_year(store, fy, *, out_dir=None) -> Path
+export_all(store, *, today, out_dir=None) -> list[Path]
+ensure_profile(path=None) -> Path
+```
+
+Australian financial years (July–June), written to `data/exports/FY<year>/summary.md`.
+`ensure_profile` creates `data/profile.md` once and never overwrites it. A store with no
+directory refuses to export rather than picking a location — the same rule as §4.3.
+
+### 10.6 `llm/` — providers
+
+A provider-neutral `Protocol` (`Provider`) with neutral messages, tool specs and
+classification results, and two implementations:
+
+- **Anthropic**, with extended thinking (a budget, and a fallback when the model rejects
+  it) and verbatim raw content blocks.
+- **OpenAI-compatible**, covering OpenAI, DeepSeek, OpenRouter and a local Ollama endpoint;
+  reasoning content is captured where the provider exposes it.
+
+The vendor SDKs are imported lazily inside the provider, so the core stays dependency-free.
+`factory.resolve/build/get_provider/provider_status/test_key` turn `Settings` + `Secrets`
+into a provider and a human-readable reason when one cannot be built (no key, no model, no
+SDK). There is **no module-level cache holding a plaintext key**; a cache, if added, keys on
+a hash. `json_object` tolerates fenced or prose-wrapped JSON, because a parser that rejects
+what a model actually returns is a parser that fails in production.
+
+### 10.7 `assistant/` — the chat loop
+
+```python
+build_system(store, *, today) -> str
+finance_context(store) -> str
+execute_tool(store, name, arguments, *, today, save=True) -> dict
+load_history(store, limit=HISTORY_LIMIT) / clear(store)
+send(store, user_text, *, provider, today, now=None, save=False) -> dict
+```
+
+Up to `MAX_TOOL_ROUNDS = 8` tool rounds, then a final answer with tools disabled. All 15
+tools are bound to GridFinance: `get_finance_context`, `search_transactions`,
+`get_spending_summary`, `list_uncategorised`, `list_review_items`, `list_categories`,
+`set_category`, `create_rule`, `add_note`, `write_summaries`, `read_profile`,
+`append_to_profile`, `list_recurring`, `upcoming_expenses`, `query_sql`.
+
+Mutating tools are gated by `Settings.ai_writes`; before the first write the loop captures a
+`before-ai` revision. Every write goes through the `Store`, and the caller decides when to
+save, so a failed tool round is not made durable by the chat loop itself. The transcript
+persists `content` as raw
+markdown, `thinking` separately, and the provider's raw blocks verbatim, because Anthropic
+requires its thinking blocks replayed on a later turn. History is repaired before sending:
+an incomplete tool round is trimmed and consecutive user turns are merged, so a half-saved
+transcript cannot make every later turn fail.
+
+### 10.8 `mcp_server.py`
+
+`create_server(store=None, *, today=None, data_dir=None)` and `main()` expose the same tools
+over stdio MCP, with `finance://context` and `finance://accounts` resources. FastMCP 1.x is
+preferred and `mcp.server.mcpserver` (2.x) is the fallback. When no store is injected the
+server opens a fresh one per call; a write is permitted only under `Settings.ai_writes`, a
+`before-ai` revision precedes the first one, and the store is saved only when the tool
+returned `{"ok": true}` — a refused or failed call changes nothing.
+
+### 10.9 `query.py` — read-only SQL
+
+```python
+run_query(sql, *, path=None, limit=200) -> {"columns": [...], "rows": [...], "count": n}
+```
+
+One SELECT or WITH statement, on a `mode=ro` connection, with a SQLite authorizer as the
+real enforcement rather than a keyword blocklist. Comments and string literals are removed
+before the statement is checked, so a semicolon inside a description is not mistaken for a
+second statement, and a `LIMIT` is always applied by wrapping the query. The schema help is
+derived from `db.TABLES`, so it cannot drift from the store.
+
+### 10.10 `httpapi.py` — the local API
+
+```python
+hash_pin(pin) / Api / make_server(...) / serve(*, data_dir=None, pin_hash=None,
+                                               host="127.0.0.1", port=8000) / main()
+```
+
+A stdlib `ThreadingHTTPServer` on the loopback interface only, exposing the read-only
+CDR-shaped endpoints — `/cds-au/v1/discovery/status`, `/cds-au/v1/banking/accounts`, and
+per account `/balance` and `/transactions` with paging — plus `/health`. An account may be
+addressed by its external id or as `acc_<id>`. The PIN is compared as a SHA-256 hash from
+`secrets.app_pin_hash`, via bearer token or cookie. Each request opens the store with
+`create=False`; a missing, corrupt or busy store is a 503 rather than an empty answer, and
+paging preserves the caller's filters. It never writes.
+
+### 10.11 `migrate_afm.py` — the one-way migration
+
+```python
+plan(afm_db, *, allow_live=False) -> (StoreDocument, Settings, Secrets, MigrationReport)
+migrate(afm_db, data_dir, *, force=False, dry_run=False, allow_live=False) -> MigrationReport
+main(argv=None) -> int        # scripts/migrate_afm.py is a thin wrapper
+```
+
+The source is copied to a temporary snapshot before it is read, so opening it cannot create
+a `-shm` beside the user's database; a non-empty write-ahead log is refused unless
+`--allow-live`. Required tables and columns are validated, then accounts, categories,
+transactions (cents → dollars, merchant, notes, provenance, per-line currency), rules
+(bounds, match types, order-preserving priorities), open reviews, import history, chat
+transcript, settings and DPAPI-encrypted keys are mapped. Fingerprints are recomputed with
+the same function the importer uses, so a later re-import recognises the migrated rows.
+
+Nothing is written unless every row mapped and the migrated total equals the source total.
+A destination with any data is refused without `--force`; force backs up the database,
+secrets and profile, then **moves the old files aside** and rolls them back if a move fails.
+Secrets and the profile are written before the store, so a failure before the store exists
+can simply be retried. `--dry-run` prints the same refusals as `problems` and exits non-zero
+when there are any. The report names every skipped row and every warning; nothing is dropped
+silently.
+
+### 10.12 Dependencies and entry points
+
+Core remains **stdlib only**. `pyproject.toml` declares optional extras:
+
+| Extra | Adds | Without it |
+|---|---|---|
+| `ingest` | `pdfplumber` | CSV, OFX and CAMT.053 still work; a PDF import reports the missing extra |
+| `ai` | `anthropic`, `openai` | no assistant or LLM classification; the reason is surfaced |
+| `mcp` | `mcp` | the MCP server cannot start; everything else works |
+| `dev` | `pytest` | — |
+| `all` | all of the above | — |
+
+Entry points: `python -m finance_tool.mcp_server` (stdio MCP),
+`python -m finance_tool.httpapi` (loopback API using the stored PIN), and
+`python scripts/migrate_afm.py --help`. The backend is otherwise imported, not launched.

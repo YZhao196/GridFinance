@@ -149,7 +149,9 @@ def test_settings_do_not_keep_a_second_copy_of_the_canvases(conn):
     conn.commit()
 
     row = conn.execute('SELECT data FROM "settings" WHERE id = 1').fetchone()
-    assert "c_" not in row["data"]                     # no canvas ids in the blob
+    # No canvas ids in the blob. (A bare "c_" is not the test: a settings key may contain
+    # those two characters without being a canvas.)
+    assert all(canvas.id not in row["data"] for canvas in settings.canvases)
     assert dbm.read_settings(conn) == settings         # but they come back
 
 

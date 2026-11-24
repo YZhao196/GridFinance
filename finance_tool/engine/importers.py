@@ -9,8 +9,9 @@ Normalisation produces one shape — ``date``, signed ``amount`` (negative is mo
 and ``description`` — and every parser produces that shape, so nothing downstream cares
 where a row came from.
 
-This module and :mod:`finance_tool.engine.sync` are the only two in the engine allowed
-to touch the filesystem or a socket (§15).
+This module, :mod:`finance_tool.engine.intake`, :mod:`finance_tool.engine.sync` and
+:mod:`finance_tool.engine.exports` are the engine's file and socket boundary (§15);
+:mod:`finance_tool.engine.statements` is pure and receives bytes or text.
 """
 
 from __future__ import annotations
@@ -22,9 +23,10 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from finance_tool.engine import categorise as cat
+from finance_tool.engine import categories as cats
 from finance_tool.engine import detect as det
 from finance_tool.store.entities import Rule, Transaction
 from finance_tool.store.store import StoreView, new_id
@@ -40,7 +42,16 @@ class RawTxn:
     amount: float
     description: str
     external_id: str | None = None
-    raw: dict[str, str] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
+    # A parser that can name the merchant (CAMT, PDF, OFX payee) says so; rules match
+    # against it, and CSV rows derive it from the description.
+    merchant: str | None = None
+    value_date: date | None = None
+    status: str = "posted"
+    # The text identity is computed over when the stored description was cleaned. A feed
+    # tidies "COLES 123456" for display; the fingerprint must still match the CSV row
+    # that was never tidied.
+    identity_description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,10 @@ class ParseResult:
     headers: list[str] = field(default_factory=list)
     header_row: int | None = None
     warnings: list[str] = field(default_factory=list)
+    # Statement-level facts the rows cannot carry: account identity, currency, opening
+    # and closing balances, the period. A feed uses them to update the account.
+    meta: dict[str, Any] = field(default_factory=dict)
+    format: str = ""
 
     @property
     def read(self) -> int:
@@ -141,12 +156,51 @@ class ImportSummary:
         return ", ".join(parts)
 
 
+# ------------------------------------------------------------- statement wording
+
+# Card/terminal noise banks prepend to descriptions. Stripping it is what makes the
+# merchant a stable rule target across statements that word the same shop differently.
+_CARD_NOISE = re.compile(
+    r"\b("
+    r"visa\s+purchase|visa\s+debit|eftpos|direct\s+debit|direct\s+credit|"
+    r"pending|card\s+xx+\d+|card\s+\*+\d+|contactless|purchase|"
+    r"transfer\s+to|transfer\s+from|internet\s+banking|anz\s+mobile|"
+    r"aus|au|nz|online\s+banking"
+    r")\b",
+    re.IGNORECASE,
+)
+_LONG_NUMBERS = re.compile(r"\b\d{6,}\b")
+_SPACES = re.compile(r"\s{2,}")
+# A reference tail, but only when it contains a digit: "COLES NORTHLAND" is a merchant,
+# not a reference, and stripping it would make the rule target the noise instead.
+_TRAILING_REF = re.compile(r"\s+(?=[A-Z0-9]*\d)[A-Z0-9]{8,}$")
+
+
+def clean_description(raw: str) -> str:
+    """Drop the long reference numbers a statement appends and collapse whitespace."""
+    text = _LONG_NUMBERS.sub("", raw or "")
+    text = _SPACES.sub(" ", text).strip(" -")
+    return " ".join(text.split())
+
+
+def guess_merchant(description: str) -> str | None:
+    """Strip bank noise to leave something that looks like a merchant name."""
+    text = _LONG_NUMBERS.sub(" ", description or "")
+    text = _CARD_NOISE.sub(" ", text)
+    text = _TRAILING_REF.sub("", text)
+    text = " ".join(text.split()).strip(" -*/#")
+    if len(text) < 3:
+        return None
+    return " ".join(word.capitalize() for word in text.split())
+
+
 # ------------------------------------------------------------------- date parsing
 
 
 DATE_FORMATS = (
     "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d", "%d %b %Y", "%d %B %Y",
     "%d-%b-%Y", "%d-%b-%y", "%b %d %Y", "%b %d, %Y", "%B %d, %Y",
+    "%d %b %y",
 )
 
 _SPLIT_DATE = re.compile(r"^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})$")
@@ -531,7 +585,11 @@ def parse_csv(
     column_map: ColumnChoice | None = None,
 ) -> ParseResult:
     """Parse a bank CSV, detecting its columns rather than assuming a schema."""
-    rows = read_rows(text, delimiter)
+    try:
+        rows = read_rows(text, delimiter)
+    except csv.Error as exc:
+        return ParseResult(source=source, format="csv",
+                           warnings=[f"could not read the CSV ({exc})"])
     rows = [row for row in rows if any(str(cell).strip() for cell in row)]
     if not rows:
         return ParseResult(source=source, warnings=["the file has no rows"])
@@ -582,7 +640,8 @@ def parse_csv(
     if columns.confidence < MATCH_THRESHOLD:
         warnings.append(f"column detection is uncertain ({columns.reason})")
     return ParseResult(source=source, rows=parsed, skipped=skipped, columns=columns,
-                       headers=headers, header_row=header_row, warnings=warnings)
+                       headers=headers, header_row=header_row, warnings=warnings,
+                       format="csv")
 
 
 def _parses_cleanly(rows: Sequence[Sequence[str]], columns: ColumnChoice) -> int:
@@ -661,7 +720,7 @@ def _parse_row(row: Sequence[str], columns: ColumnChoice, raw: dict[str, str]) -
             break
 
     return RawTxn(date=when, amount=amount, description=description,
-                  external_id=external, raw=raw)
+                  external_id=external, raw=raw, merchant=guess_merchant(description))
 
 
 # -------------------------------------------------------------------------- OFX
@@ -728,14 +787,16 @@ def parse_ofx(text: str, *, source: str = "ofx") -> ParseResult:
                 continue
             external_ids.add(fitid)
 
+        merchant = guess_merchant(record.get("NAME", "") or record.get("PAYEE", "")
+                                  or description)
         parsed.append(RawTxn(date=when, amount=amount, description=description,
-                             external_id=fitid, raw=dict(record)))
+                             external_id=fitid, raw=dict(record), merchant=merchant))
 
     return ParseResult(
         source=source, rows=parsed, skipped=skipped,
         columns=ColumnChoice(confidence=1.0, reason="OFX fields, not columns"),
         headers=sorted({key for record in records for key in record}),
-        warnings=[],
+        warnings=[], format="ofx",
     )
 
 
@@ -753,10 +814,8 @@ def parse_ofx_date(text: str) -> date | None:
 # --------------------------------------------------------------------- dispatch
 
 OFX_SUFFIXES = {".ofx", ".qfx"}
-
-# CAMT.053 is not implemented: §20 marks it not required and §38 says it is worth an
-# afternoon only if such a file ever actually arrives. The dispatch below is the single
-# entry point it would plug into.
+CAMT_SUFFIXES = {".xml"}
+PDF_MAGIC = b"%PDF-"
 
 
 def decode(data: bytes) -> str:
@@ -774,14 +833,27 @@ def parse_file(path: str | Path, *, source: str | None = None) -> ParseResult:
     target = Path(path)
     label = source or target.name
     try:
-        text = decode(target.read_bytes())
+        data = target.read_bytes()
     except OSError as exc:
         return ParseResult(source=label, warnings=[f"could not read {target.name}: {exc}"])
 
     suffix = target.suffix.casefold()
-    if suffix in OFX_SUFFIXES or _looks_like_ofx(text):
-        return parse_ofx(text, source=label)
-    return parse_csv(text, source=label)
+    try:
+        if data.startswith(PDF_MAGIC) or suffix == ".pdf":
+            from finance_tool.engine import statements
+            return statements.parse_pdf(data, source=label)
+
+        text = decode(data)
+        # Content beats a misleading suffix: an OFX 2.0 file saved as .xml is still OFX.
+        if _looks_like_ofx(text) or suffix in OFX_SUFFIXES:
+            return parse_ofx(text, source=label)
+        if suffix in CAMT_SUFFIXES or _looks_like_camt(text):
+            from finance_tool.engine import statements
+            return statements.parse_camt053(text, source=label)
+        return parse_csv(text, source=label)
+    except Exception as exc:  # a parser must never raise out of the import boundary
+        return ParseResult(source=label,
+                           warnings=[f"could not read {target.name}: {exc}"])
 
 
 def _looks_like_ofx(text: str) -> bool:
@@ -789,12 +861,28 @@ def _looks_like_ofx(text: str) -> bool:
     return "OFXHEADER" in head or "<OFX>" in head or "<STMTTRN>" in head
 
 
+def _looks_like_camt(text: str) -> bool:
+    head = text[:4096]
+    return "<Document" in head and ("camt.053" in head.lower() or "BkToCstmrStmt" in head)
+
+
 def parse_bytes(data: bytes, *, source: str = "upload") -> ParseResult:
     """Parse in-memory bytes — what a sync response gives us, with no file involved."""
-    text = decode(data)
-    if _looks_like_ofx(text):
-        return parse_ofx(text, source=source)
-    return parse_csv(text, source=source)
+    try:
+        if data.startswith(PDF_MAGIC):
+            from finance_tool.engine import statements
+            return statements.parse_pdf(data, source=source)
+
+        text = decode(data)
+        if _looks_like_camt(text):
+            from finance_tool.engine import statements
+            return statements.parse_camt053(text, source=source)
+        if _looks_like_ofx(text):
+            return parse_ofx(text, source=source)
+        return parse_csv(text, source=source)
+    except Exception as exc:  # a parser must never raise out of the import boundary
+        return ParseResult(source=source,
+                           warnings=[f"could not read the statement: {exc}"])
 
 
 # ---------------------------------------------------------------- identity (§21)
@@ -869,23 +957,39 @@ def plan_import(
     *,
     source: str,
     account: str,
+    identity_source: str | None = None,
 ) -> ImportPlan:
     """Decide which rows are new and which the store already has.
 
     Identity is external id first, always; the fingerprint is the fallback for rows that
-    have none, and is only ever compared against rows from the same source.
+    have none. ``identity_source`` is what the fingerprint is scoped to — the statement
+    format, not the file name, so the same rows re-downloaded under a new name are still
+    recognised as already present.
     """
-    known_external = {t.external_id for t in existing if t.external_id}
-    known_fingerprints = {t.fingerprint for t in existing if t.fingerprint}
+    identity = identity_source or source
+    # Identities are scoped to the account: the same external id or the same row can
+    # legitimately exist once in each of two accounts.
+    scoped = [t for t in existing if t.account == account]
+    known_external = {t.external_id for t in scoped if t.external_id}
+    known_fingerprints = {t.fingerprint for t in scoped if t.fingerprint}
 
     seen: dict[tuple, int] = {}
     seen_external: set[str] = set()
+    planned_fingerprints: set[str] = set()
     planned: list[PlannedRow] = []
 
     for raw in rows:
-        key = (raw.date, round(raw.amount, 2), normalise_description(raw.description))
+        identity_text = (raw.identity_description
+                         if raw.identity_description is not None else raw.description)
+        key = (raw.date, round(raw.amount, 2), normalise_description(identity_text))
         index = seen.get(key, 0)
         seen[key] = index + 1
+        # Every row gets a fingerprint, including rows with an external id. The id stays
+        # authoritative for that row, but the fingerprint is what lets the same
+        # transaction arriving later from a different export (a statement CSV after a
+        # CAMT file, say) be recognised as already present.
+        mark = fingerprint(raw.date, raw.amount, identity_text, account, identity,
+                           index=index)
 
         if raw.external_id:
             # An id that appears twice in one batch is the same transaction twice — the
@@ -894,14 +998,16 @@ def plan_import(
             duplicate = (raw.external_id in known_external
                          or raw.external_id in seen_external)
             seen_external.add(raw.external_id)
+            planned_fingerprints.add(mark)
             planned.append(PlannedRow(
-                raw=raw, external_id=raw.external_id, duplicate=duplicate,
+                raw=raw, fingerprint=mark, external_id=raw.external_id,
+                duplicate=duplicate,
                 reason="external id already imported" if duplicate else "",
             ))
             continue
 
-        mark = fingerprint(raw.date, raw.amount, raw.description, account, source, index=index)
-        duplicate = mark in known_fingerprints
+        duplicate = mark in known_fingerprints or mark in planned_fingerprints
+        planned_fingerprints.add(mark)
         planned.append(PlannedRow(
             raw=raw, fingerprint=mark, duplicate=duplicate,
             reason="same date, amount and description already imported" if duplicate else "",
@@ -920,23 +1026,48 @@ def build_transaction(
     account: str,
     rules: Sequence[Rule] | None = None,
     now: datetime | None = None,
+    import_id: str | None = None,
+    categories: set[str] | None = None,
 ) -> Transaction:
     """A stored transaction from a planned row, categorised on the way in."""
     raw = planned.raw
-    decision = cat.categorise(raw.description, list(rules or []))
+    decision = cat.categorise(raw.description, list(rules or []), merchant=raw.merchant,
+                              amount=raw.amount, count_hit=True)
+    hint = str((raw.raw or {}).get("provider_category") or "").strip()
+    if decision.categorised:
+        category = decision.category
+        category_source = "rule" if decision.rule_id else ""
+        confidence = 1.0 if decision.rule_id else None
+    elif (hint and categories and hint in categories
+          and hint != cats.UNCATEGORISED and not cats.is_transfer(hint)):
+        # A bank's own category is used only when it is exactly one of ours. It is a
+        # suggestion with a source, not a guess: anything else goes to the rules/review.
+        category = hint
+        category_source = "bank"
+        confidence = 0.95
+    else:
+        category = decision.category
+        category_source = ""
+        confidence = None
     return Transaction(
         id=new_id("transactions"),
         date=raw.date,
         amount=raw.amount,
         description=raw.description,
         account=account,
-        category=decision.category,
+        category=category,
         tags=list(decision.tags),
         external_id=raw.external_id,
         fingerprint=planned.fingerprint,
         source=source,
         imported_at=now or datetime.now(),
         rule_id=decision.rule_id,
+        merchant=raw.merchant,
+        value_date=raw.value_date,
+        status=raw.status,
+        import_id=import_id,
+        category_source=category_source,
+        category_confidence=confidence,
     )
 
 
@@ -950,6 +1081,8 @@ def import_rows(
     now: datetime | None = None,
     skipped: Sequence[SkippedRow] = (),
     warnings: Sequence[str] = (),
+    import_id: str | None = None,
+    identity_source: str | None = None,
 ) -> ImportSummary:
     """Run planned rows through categorisation and into the store.
 
@@ -957,7 +1090,10 @@ def import_rows(
     looks wrong is a signal, not noise (§21).
     """
     chosen_rules = list(store.doc.rules if rules is None else rules)
-    plan = plan_import(store.view().transactions, rows, source=source, account=account)
+    known_categories = (set(cat.categories_in_use(store.view()))
+                        | set(cats.names()))
+    plan = plan_import(store.view().transactions, rows, source=source, account=account,
+                       identity_source=identity_source)
 
     imported = duplicates = categorised = 0
     for planned in plan.rows:
@@ -965,7 +1101,8 @@ def import_rows(
             duplicates += 1
             continue
         txn = build_transaction(planned, source=source, account=account,
-                                rules=chosen_rules, now=now)
+                                rules=chosen_rules, now=now, import_id=import_id,
+                                categories=known_categories)
         store.doc.transactions.append(txn)
         imported += 1
         if txn.category:
@@ -997,10 +1134,50 @@ def import_parse_result(
     account: str,
     rules: Sequence[Rule] | None = None,
     now: datetime | None = None,
+    import_id: str | None = None,
 ) -> ImportSummary:
-    return import_rows(store, parsed.rows, source=parsed.source, account=account,
-                       rules=rules, now=now, skipped=parsed.skipped,
-                       warnings=parsed.warnings)
+    summary = import_rows(store, parsed.rows, source=parsed.source, account=account,
+                          rules=rules, now=now, skipped=parsed.skipped,
+                          warnings=parsed.warnings, import_id=import_id,
+                          # The filename is display provenance; identity is the import
+                          # itself, so the same rows re-downloaded or exported in another
+                          # format dedupe. Two separate files with a truly identical row
+                          # are indistinguishable from overlap without an external id;
+                          # treating them as overlap is the safe direction for totals.
+                          identity_source="import")
+    _apply_statement_meta(store, parsed, account)
+    return summary
+
+
+def _apply_statement_meta(store, parsed: ParseResult, account: str) -> None:
+    """Update the account's balance from a statement's closing balance.
+
+    Only when the currencies agree: a closing balance in a currency the account is not
+    held in would silently rewrite a number that belongs somewhere else.
+    """
+    meta = parsed.meta or {}
+    closing = meta.get("closing_balance")
+    if closing is None:
+        return
+    closing_date = meta.get("closing_date") or meta.get("period_end")
+    if not isinstance(closing_date, date):
+        # Without a date there is no way to tell a newer statement from an older one,
+        # and overwriting a current balance with an undated one is the worse guess.
+        return
+    target = store.view().account(account)
+    if target is None:
+        return
+    currency = str(meta.get("currency") or "").upper()
+    if target.currency and currency and target.currency.upper() != currency:
+        return
+    if target.balance_as_of is not None and closing_date < target.balance_as_of:
+        return
+    value = float(closing)
+    if float(target.balance) == value and target.balance_as_of == closing_date:
+        return
+    target.balance = value
+    target.balance_as_of = closing_date
+    store.version += 1
 
 
 def import_file(

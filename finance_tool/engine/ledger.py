@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Iterable, Sequence
 
+from finance_tool.engine import categories as cats
 from finance_tool.engine import periods as per
 from finance_tool.engine import recurrence as rec
 from finance_tool.store.entities import EXPENSE, INCOME, Item, Transaction
@@ -139,11 +140,18 @@ def totals_for_transactions(
     start: date,
     end: date,
 ) -> Totals:
-    """Reconciled totals. A transaction carries its own sign, so a positive is income."""
+    """Reconciled totals. A transaction carries its own sign, so a positive is income.
+
+    A transfer is the user moving their own money, not earning or spending it. Counting
+    one side would inflate a total; counting both sides cancels only when both were
+    imported, so neither is counted at all.
+    """
     income = expenses = 0.0
     income_count = expense_count = 0
     for txn in transactions:
         if txn.date is None or not (start <= txn.date <= end):
+            continue
+        if cats.is_transfer(txn.category):
             continue
         if txn.amount >= 0:
             income += txn.amount
@@ -337,6 +345,8 @@ def budget_vs_actual(
     for txn in view.transactions:
         if txn.date is None or not (span[0] <= txn.date <= span[1]) or txn.amount >= 0:
             continue
+        if cats.is_transfer(txn.category):
+            continue
         key = txn.category or UNCATEGORISED
         actual[key] = actual.get(key, 0.0) + abs(txn.amount)
 
@@ -394,6 +404,8 @@ def budget_coverage(
         if txn.date is None:
             continue
         if span is not None and not (span[0] <= txn.date <= span[1]):
+            continue
+        if cats.is_transfer(txn.category):
             continue
         if expenses_only and txn.amount >= 0:
             continue

@@ -3,9 +3,13 @@ from datetime import date
 
 import pytest
 
+from finance_tool.engine import review
 from finance_tool.hooks import cache as hc
+from finance_tool.hooks import library
 from finance_tool.hooks import templates as ht
 from finance_tool.hooks.types import HookContext, Row, WidgetData, widget_data
+from finance_tool.store.entities import Settings, StoreDocument, Transaction
+from finance_tool.store.store import Store
 
 from fixtures import TODAY, build_store
 
@@ -365,3 +369,21 @@ def test_peers_are_gathered_from_the_canvas(ctx):
 
     assert set(peers) == {"a", "c"}
     assert hc.with_peers(ctx, peers).peer("a").value == 1.0
+
+
+def test_the_review_widget_appears_when_only_queued_rows_remain():
+    store = Store(doc=StoreDocument(transactions=[Transaction(
+        id="t_low", date=date(2026, 10, 3), amount=-10.0, description="MYSTERY",
+        account="a_everyday", category="Housing", category_source="llm",
+        category_confidence=0.4, needs_review=True)]),
+        settings=Settings(), data_dir=None)
+    review.queue(store, store.view().transaction("t_low"))
+    context = HookContext(store=store.view(), lens="month", start=OCTOBER[0],
+                          end=OCTOBER[1], label="October 2026", today=TODAY)
+
+    data = library.uncategorised_review(context, {})
+
+    assert data is not None
+    assert data.value == 1
+    assert data.extra["queued"] == 1
+    assert "waiting for review" in data.note

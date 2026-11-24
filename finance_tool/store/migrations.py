@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+# The document marker is separate from the database's `PRAGMA user_version`; the
+# document has not changed shape, only the SQL schema has.
 SCHEMA_VERSION = 1
 
 Migration = Callable[[dict[str, Any]], dict[str, Any]]
